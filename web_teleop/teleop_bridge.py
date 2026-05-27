@@ -23,6 +23,8 @@ Run (inside the container):
 import io
 import json
 import os
+import ssl
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,7 +41,10 @@ from unitree_api.msg import Request
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-HTTP_PORT = 8080
+HTTP_PORT = 8080      # plain HTTP — fine for the 2D page
+HTTPS_PORT = 8443     # HTTPS (self-signed) — REQUIRED for the WebXR/VR page
+CERT_PATH = "/tmp/teleop_cert.pem"
+KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 
@@ -59,7 +64,17 @@ PUBLISH_HZ = 10.0      # MOVE republish rate
 HEARTBEAT_S = 0.3      # resend MOVE at least this often even if unchanged
 STREAM_FPS = 30.0
 
-HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+HTML_PATH = os.path.join(WEB_DIR, "index.html")
+
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript",
+    ".css": "text/css",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".ico": "image/x-icon",
+}
 
 # ---------------------------------------------------------------------------
 # JPEG encoder: prefer Pillow, fall back to OpenCV. One of these must be present
@@ -264,7 +279,25 @@ class Handler(BaseHTTPRequestHandler):
             self._stream_mjpeg()
             return
 
+        # Static files from web_teleop/ (e.g. /vr.html, /three.min.js).
+        if self._serve_static(path):
+            return
+
         self._send(404, "text/plain", b"not found")
+
+    def _serve_static(self, path):
+        rel = path.lstrip("/")
+        if not rel or ".." in rel or rel.startswith("/"):
+            return False
+        full = os.path.realpath(os.path.join(WEB_DIR, rel))
+        if not full.startswith(WEB_DIR + os.sep) or not os.path.isfile(full):
+            return False
+        ext = os.path.splitext(full)[1].lower()
+        ctype = _CONTENT_TYPES.get(ext, "application/octet-stream")
+        with open(full, "rb") as f:
+            body = f.read()
+        self._send(200, ctype, body)
+        return True
 
     def _stream_mjpeg(self):
         self.send_response(200)
@@ -291,7 +324,36 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _serve_http():
-    srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
+
+
+def _ensure_cert():
+    """Generate a self-signed cert if missing. WebXR needs a secure context
+    (HTTPS) when the Quest connects over the LAN; the user clicks through the
+    self-signed warning once."""
+    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+        return True
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", KEY_PATH, "-out", CERT_PATH, "-days", "365",
+             "-subj", "/CN=go2w-teleop"],
+            check=True, capture_output=True, timeout=30,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[teleop] HTTPS disabled — cert generation failed: {e}")
+        print("[teleop] The 2D page still works over HTTP; VR needs HTTPS.")
+        return False
+
+
+def _serve_https():
+    if not _ensure_cert():
+        return
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+    srv = ThreadingHTTPServer(("0.0.0.0", HTTPS_PORT), Handler)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.serve_forever()
 
 
@@ -299,6 +361,12 @@ def main():
     rclpy.init()
     node = TeleopBridge()
     threading.Thread(target=_serve_http, daemon=True).start()
+    threading.Thread(target=_serve_https, daemon=True).start()
+    node.get_logger().info(
+        f"  2D page:  http://<laptop-ip>:{HTTP_PORT}/")
+    node.get_logger().info(
+        f"  VR page:  https://<laptop-ip>:{HTTPS_PORT}/vr.html  "
+        f"(accept the self-signed cert warning)")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
