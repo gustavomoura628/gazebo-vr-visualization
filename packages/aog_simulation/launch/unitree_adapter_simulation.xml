@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<?xml-model href="https://raw.githubusercontent.com/ros2/rcl_interfaces/master/launch_xml/schema/launch.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+
+<launch>
+  <node pkg="aog_simulation" exec="unitree_sport_mode_adapter" output="screen" />
+
+  <!-- Spawn TurtleBot4 simulation -->
+  <include file="$(find-pkg-share turtlebot4_ignition_bringup)/launch/turtlebot4_ignition.launch.py">
+    <arg name="gazebo" value="ignition"/>
+    <arg name="gz_args" value=""/>
+    <arg name="autostart" value="false"/>
+    <!-- <arg name="use_respawn" value="true"/> -->
+  </include>
+</launch>

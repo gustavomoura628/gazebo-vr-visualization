@@ -1,0 +1,45 @@
+// For format details, see https://aka.ms/devcontainer.json.
+{
+  "name": "AKCIT Open Gateway People Search",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "devcontainer",
+    "args": {
+      "USERNAME": "${localEnv:USER}"
+    }
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/${localEnv:USER}/${localWorkspaceFolderBasename},type=bind",
+  "workspaceFolder": "/home/${localEnv:USER}/${localWorkspaceFolderBasename}",
+  "mounts": [
+    "source=${localWorkspaceFolder}/packages,target=/ros2_ws/src/akcit,type=bind,readonly"
+  ],
+  "containerUser": "${localEnv:USER}",
+  "remoteUser": "${localEnv:USER}",
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:/home/${localEnv:USER}/.local/bin",
+    "PYTHONPATH": "/opt/ros/${containerEnv:ROS_DISTRO}/lib/python3.10/site-packages:/opt/ros/${containerEnv:ROS_DISTRO}/local/lib/python3.10/dist-packages:${containerEnv:PYTHONPATH}",
+    "VSCODE_WORKSPACE": "${containerWorkspaceFolder}"
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.autoComplete.extraPaths": [
+          "/opt/ros/${containerEnv:ROS_DISTRO}/lib/python3.10/site-packages",
+          "/opt/ros/${containerEnv:ROS_DISTRO}/local/lib/python3.10/dist-packages"
+        ],
+        "python.analysis.extraPaths": [
+          "/opt/ros/${containerEnv:ROS_DISTRO}/lib/python3.10/site-packages",
+          "/opt/ros/${containerEnv:ROS_DISTRO}/local/lib/python3.10/dist-packages"
+        ],
+        "ROS2.distro": "${containerEnv:ROS_DISTRO}",
+        "ROS2.rosSetupScript": "${containerEnv:ROS_WS}/install/setup.bash",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      },
+      "extensions": [
+        "Ranch-Hand-Robotics.rde-ros-2",
+        "yzhang.markdown-all-in-one"
+      ]
+    }
+  }
+}
