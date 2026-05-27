@@ -69,8 +69,7 @@ VX_MIN = -0.4
 VY_MAX = 0.1
 VYAW_MAX = 2.2
 
-CMD_TIMEOUT = 0.75   # watchdog: stop if no control for this long (widened to avoid
-                     # stop/go stutter when control updates briefly lag)
+CMD_TIMEOUT = 0.4    # safety watchdog: stop if no control arrives for this long
 PUBLISH_HZ = 10.0
 HEARTBEAT_S = 0.3
 VIDEO_FPS = 30
@@ -98,6 +97,10 @@ class Shared:
         self.vy = 0.0
         self.vyaw = 0.0
         self.cmd_t = 0.0  # monotonic time of last control msg
+        # rolling stats for the 1 Hz control log (reset by take_stats)
+        self.n_msgs = 0
+        self.n_zero = 0
+        self.n_nonzero = 0
 
     def set_cmd(self, vx, vy, vyaw):
         with self.cmd_lock:
@@ -105,6 +108,17 @@ class Shared:
             self.vy = _clamp(float(vy), -VY_MAX, VY_MAX)
             self.vyaw = _clamp(float(vyaw), -VYAW_MAX, VYAW_MAX)
             self.cmd_t = time.monotonic()
+            self.n_msgs += 1
+            if abs(self.vx) < 1e-3 and abs(self.vy) < 1e-3 and abs(self.vyaw) < 1e-3:
+                self.n_zero += 1
+            else:
+                self.n_nonzero += 1
+
+    def take_stats(self):
+        with self.cmd_lock:
+            s = (self.n_msgs, self.n_zero, self.n_nonzero, self.vx, self.vyaw)
+            self.n_msgs = self.n_zero = self.n_nonzero = 0
+            return s
 
 
 SHARED = Shared()
@@ -127,6 +141,7 @@ class TeleopNode(Node):
         self._last_pub = (None, None, None)
         self._last_pub_t = 0.0
         self._was_moving = False
+        self._log_ticks = 0
         self.get_logger().info("Quest teleop bridge (WebRTC) node up.")
 
     def _on_image(self, msg: Image):
@@ -161,6 +176,20 @@ class TeleopNode(Node):
             self._publish(API_STOPMOVE, {})
             self._was_moving = False
             self._last_pub = (None, None, None)
+
+        # ~1 Hz control log: surfaces command rate, zero/nonzero split, and the
+        # number of connected WebRTC peers. >1 peer = two clients fighting for
+        # control (look HERE before theorizing about stutter).
+        self._log_ticks += 1
+        if self._log_ticks >= int(PUBLISH_HZ):
+            self._log_ticks = 0
+            n, z, nz, lvx, lvyaw = SHARED.take_stats()
+            npeers = len(PCS)
+            if n > 0 or npeers > 1:
+                flag = "  <-- MULTIPLE PEERS (control conflict?)" if npeers > 1 else ""
+                self.get_logger().info(
+                    f"[ctl] peers={npeers} {n}/s (zero {z}/nonzero {nz}) "
+                    f"vx={lvx:.2f} vyaw={lvyaw:.2f}{flag}")
 
     def _publish(self, api_id, payload):
         req = Request()
