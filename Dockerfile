@@ -95,6 +95,14 @@ FROM base AS workspace
 RUN pip3 install --no-cache-dir pillow
 COPY web_teleop/ /web_teleop/
 
+# NOTE on speed: the TurtleBot4 is a Create3 base, hard-limited to ~0.46 m/s by
+# its motion_control safety layer. Raising the diff-drive controller's body-twist
+# limits does nothing (the cap is upstream). The real lever is the Create3
+# "safety_override" parameter — set to "full" at runtime by run_teleop_bridge.sh,
+# which unlocks the base's true max (~0.46 m/s) and removes the safe-speed throttle.
+# (Combined max-forward + max-turn is still wheel-saturation limited; that's
+# inherent to the Create3 base and won't affect the real Go2W.)
+
 # Set the entrypoint to source the workspace setup script
 ENTRYPOINT ["/bin/bash", "-c", "source /opt/ros/$ROS_DISTRO/setup.bash && source $ROS_WS/install/setup.bash && exec \"$@\"", "--"]
 CMD ["bash"]

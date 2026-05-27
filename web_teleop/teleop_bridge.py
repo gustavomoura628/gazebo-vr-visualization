@@ -54,10 +54,12 @@ API_STOPMOVE = 1003
 # Velocity caps (m/s, m/s, rad/s). Reverse is deliberately limited: the TB4
 # stand-in has a backup-limit safety reflex that wedges motion_control if you
 # drive backward for long. Forward/turn are the main teleop axes.
-VX_MAX = 0.5
-VX_MIN = -0.15
-VY_MAX = 0.30
-VYAW_MAX = 1.20
+# Caps sized to the Create3 base's real max (~0.46 m/s) with a little headroom;
+# the base enforces its own true limit below these via safety_override=full.
+VX_MAX = 0.6
+VX_MIN = -0.4
+VY_MAX = 0.1
+VYAW_MAX = 2.2
 
 CMD_TIMEOUT = 0.4      # s without a fresh /cmd -> stop (watchdog)
 PUBLISH_HZ = 10.0      # MOVE republish rate

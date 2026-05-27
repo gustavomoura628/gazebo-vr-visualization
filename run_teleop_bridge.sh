@@ -39,5 +39,10 @@ echo
 docker exec -it "${CONTAINER}" bash -lc "
     source /opt/ros/humble/setup.bash
     source /ros2_ws/install/setup.bash
+    # Unlock the Create3 base's full speed (lifts the ~0.3 m/s safe-speed throttle
+    # to the ~0.46 m/s max and disables the backup limit). Harmless if it's already set.
+    echo 'Setting Create3 safety_override=full...'
+    ros2 param set /motion_control safety_override full 2>&1 | head -1 \
+        || echo '(could not set safety_override — is the sim fully up?)'
     exec python3 /web_teleop/teleop_bridge.py
 "
