@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
-"""Quest teleop bridge — a single node that puppets the go2w sim from a browser.
+"""Quest teleop bridge — WebRTC edition.
 
-Runs INSIDE the sim container (so it's on the same ROS graph; the container is
---net=host, so its HTTP port is reachable from the Quest over WiFi). One port
-serves everything:
+Puppets the go2w sim from a browser / Quest headset. Runs INSIDE the sim
+container (same ROS graph; --net=host so its ports are reachable over WiFi).
 
-  GET /            -> the web UI (web_teleop/index.html)
-  GET /stream      -> MJPEG video of /oakd/rgb/preview/image_raw
-  GET /cmd?vx=&vy=&vyaw=  -> set the desired body velocity (browser sends ~20 Hz)
-  GET /stop        -> zero the command (sends STOPMOVE)
+Why WebRTC (vs the old MJPEG):
+  - Video goes over UDP, so packet loss on a flaky hotspot drops a frame
+    instead of stalling the whole stream (TCP head-of-line blocking was the
+    main cause of the choppiness).
+  - Control travels on a SEPARATE, unreliable+unordered DataChannel — fully
+    decoupled from video, lowest latency, never blocks behind a video frame.
+  - Browser-side, control is sent on its own timer, not the render loop.
 
-It republishes the latest commanded velocity as Unitree sport-mode MOVE (api
-1008) on /api/sport/request at a steady rate, which (a) drives the robot and
-(b) dodges the ROS 2 discovery race that drops a single one-shot MOVE. If no
-fresh command arrives within CMD_TIMEOUT (browser closed / tab backgrounded),
-it falls back to STOPMOVE as a watchdog.
+Transport summary:
+  HTTPS (aiohttp, self-signed) on :8443  -> static pages + WebRTC signaling
+    GET  /            -> 2D page
+    GET  /vr.html     -> WebXR page
+    GET  /three.min.js, /*.js etc (static)
+    POST /offer       -> WebRTC offer/answer signaling
+  WebRTC peer:
+    video track       -> /oakd/rgb/preview/image_raw, paced ~30 fps
+    datachannel "ctl" -> {vx,vy,vyaw} JSON, unreliable/unordered
+  Plain HTTP on :8080 keeps a tiny GET /cmd fallback (fire-and-forget) and the
+    2D page, for debugging without WebRTC.
 
 Run (inside the container):
     source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash
-    python3 teleop_bridge.py            # serves on 0.0.0.0:8080
+    python3 teleop_bridge.py
 """
-import io
+import asyncio
+import fractions
 import json
 import os
 import ssl
 import subprocess
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -38,11 +47,15 @@ from rclpy.qos import (
 from sensor_msgs.msg import Image
 from unitree_api.msg import Request
 
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from av import VideoFrame
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-HTTP_PORT = 8080      # plain HTTP — fine for the 2D page
-HTTPS_PORT = 8443     # HTTPS (self-signed) — REQUIRED for the WebXR/VR page
+HTTP_PORT = 8080
+HTTPS_PORT = 8443
 CERT_PATH = "/tmp/teleop_cert.pem"
 KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
@@ -51,79 +64,21 @@ SPORT_REQUEST_TOPIC = "/api/sport/request"
 API_MOVE = 1008
 API_STOPMOVE = 1003
 
-# Velocity caps (m/s, m/s, rad/s). Reverse is deliberately limited: the TB4
-# stand-in has a backup-limit safety reflex that wedges motion_control if you
-# drive backward for long. Forward/turn are the main teleop axes.
-# Caps sized to the Create3 base's real max (~0.46 m/s) with a little headroom;
-# the base enforces its own true limit below these via safety_override=full.
 VX_MAX = 0.6
 VX_MIN = -0.4
 VY_MAX = 0.1
 VYAW_MAX = 2.2
 
-CMD_TIMEOUT = 0.4      # s without a fresh /cmd -> stop (watchdog)
-PUBLISH_HZ = 10.0      # MOVE republish rate
-HEARTBEAT_S = 0.3      # resend MOVE at least this often even if unchanged
-STREAM_FPS = 30.0
+CMD_TIMEOUT = 0.4
+PUBLISH_HZ = 10.0
+HEARTBEAT_S = 0.3
+VIDEO_FPS = 30
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
-HTML_PATH = os.path.join(WEB_DIR, "index.html")
-
 _CONTENT_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "application/javascript",
-    ".css": "text/css",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".ico": "image/x-icon",
+    ".html": "text/html; charset=utf-8", ".js": "application/javascript",
+    ".css": "text/css", ".png": "image/png", ".ico": "image/x-icon",
 }
-
-# ---------------------------------------------------------------------------
-# JPEG encoder: prefer Pillow, fall back to OpenCV. One of these must be present
-# in the container (Pillow is the lighter dep).
-# ---------------------------------------------------------------------------
-_encode = None
-try:
-    from PIL import Image as _PILImage
-
-    def _encode(w, h, rgb_bytes):  # noqa: E306
-        buf = io.BytesIO()
-        _PILImage.frombytes("RGB", (w, h), rgb_bytes).save(buf, "JPEG", quality=80)
-        return buf.getvalue()
-    _ENCODER = "pillow"
-except Exception:  # pragma: no cover
-    pass
-
-if _encode is None:
-    try:
-        import cv2
-        import numpy as np
-
-        def _encode(w, h, rgb_bytes):  # noqa: E306
-            arr = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(h, w, 3)
-            ok, jpg = cv2.imencode(".jpg", arr[:, :, ::-1],
-                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
-            return jpg.tobytes()
-        _ENCODER = "opencv"
-    except Exception:  # pragma: no cover
-        _ENCODER = None
-
-
-# ---------------------------------------------------------------------------
-# Shared state between the ROS node and the HTTP server threads
-# ---------------------------------------------------------------------------
-class Shared:
-    def __init__(self):
-        self.frame_lock = threading.Lock()
-        self.jpeg = None              # latest encoded JPEG bytes
-        self.cmd_lock = threading.Lock()
-        self.vx = 0.0
-        self.vy = 0.0
-        self.vyaw = 0.0
-        self.cmd_t = 0.0              # monotonic time of last /cmd
-
-
-SHARED = Shared()
 
 
 def _clamp(v, lo, hi):
@@ -131,87 +86,80 @@ def _clamp(v, lo, hi):
 
 
 # ---------------------------------------------------------------------------
-# ROS node
+# Shared state (written by ROS thread + asyncio thread; guarded by locks)
 # ---------------------------------------------------------------------------
-class TeleopBridge(Node):
+class Shared:
+    def __init__(self):
+        self.frame_lock = threading.Lock()
+        self.rgb = None  # HxWx3 uint8 RGB, latest camera frame
+        self.cmd_lock = threading.Lock()
+        self.vx = 0.0
+        self.vy = 0.0
+        self.vyaw = 0.0
+        self.cmd_t = 0.0  # monotonic time of last control msg
+
+    def set_cmd(self, vx, vy, vyaw):
+        with self.cmd_lock:
+            self.vx = _clamp(float(vx), VX_MIN, VX_MAX)
+            self.vy = _clamp(float(vy), -VY_MAX, VY_MAX)
+            self.vyaw = _clamp(float(vyaw), -VYAW_MAX, VYAW_MAX)
+            self.cmd_t = time.monotonic()
+
+
+SHARED = Shared()
+
+
+# ---------------------------------------------------------------------------
+# ROS node: camera in, MOVE out
+# ---------------------------------------------------------------------------
+class TeleopNode(Node):
     def __init__(self):
         super().__init__("quest_teleop_bridge")
-
-        # The ros_gz camera bridge publishers don't reliably match a plain
-        # RELIABLE subscription; BEST_EFFORT connects to anything.
         cam_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=2,
+            history=HistoryPolicy.KEEP_LAST, depth=2,
         )
         self.create_subscription(Image, CAMERA_TOPIC, self._on_image, cam_qos)
         self.pub = self.create_publisher(Request, SPORT_REQUEST_TOPIC, 10)
         self.create_timer(1.0 / PUBLISH_HZ, self._tick)
-
         self._last_pub = (None, None, None)
         self._last_pub_t = 0.0
         self._was_moving = False
-        self._frames = 0
+        self.get_logger().info("Quest teleop bridge (WebRTC) node up.")
 
-        if _ENCODER is None:
-            self.get_logger().error(
-                "No JPEG encoder available (need Pillow or OpenCV). "
-                "Video stream will be blank. Install: pip install pillow")
-        else:
-            self.get_logger().info(f"JPEG encoder: {_ENCODER}")
-        self.get_logger().info(
-            f"Quest teleop bridge up. HTTP on :{HTTP_PORT}, camera {CAMERA_TOPIC}")
-
-    # --- camera ---------------------------------------------------------
     def _on_image(self, msg: Image):
-        if _encode is None:
-            return
         w, h, step = msg.width, msg.height, msg.step
-        data = bytes(msg.data)
-        # Only rgb8/bgr8 8-bit handled; repack rows if stride has padding.
+        data = np.frombuffer(bytes(msg.data), dtype=np.uint8)
         rowbytes = w * 3
-        if step and step != rowbytes:
-            data = b"".join(data[i * step:i * step + rowbytes] for i in range(h))
-        if msg.encoding == "bgr8":
-            # swap B<->R via PIL-friendly route: handled by encoder expecting RGB,
-            # so flip here cheaply using bytearray slicing.
-            ba = bytearray(data)
-            ba[0::3], ba[2::3] = ba[2::3], ba[0::3]
-            data = bytes(ba)
         try:
-            jpg = _encode(w, h, data)
+            if step and step != rowbytes:
+                data = data.reshape(h, step)[:, :rowbytes]
+            rgb = data.reshape(h, w, 3)
+            if msg.encoding == "bgr8":
+                rgb = rgb[:, :, ::-1]
+            with SHARED.frame_lock:
+                SHARED.rgb = np.ascontiguousarray(rgb)
         except Exception as e:  # noqa: BLE001
-            self.get_logger().warn(f"encode failed: {e}")
-            return
-        with SHARED.frame_lock:
-            SHARED.jpeg = jpg
-        self._frames += 1
+            self.get_logger().warn(f"image convert failed: {e}")
 
-    # --- command republisher (the MOVE pump) ---------------------------
     def _tick(self):
         with SHARED.cmd_lock:
             vx, vy, vyaw, t = SHARED.vx, SHARED.vy, SHARED.vyaw, SHARED.cmd_t
         fresh = (time.monotonic() - t) < CMD_TIMEOUT
         moving = fresh and (abs(vx) > 1e-3 or abs(vy) > 1e-3 or abs(vyaw) > 1e-3)
-
         now = time.monotonic()
         if moving:
             cur = (round(vx, 3), round(vy, 3), round(vyaw, 3))
-            # Resend on change, or as a heartbeat, so motion stays smooth and
-            # we don't spam the adapter log every tick when holding steady.
             if cur != self._last_pub or (now - self._last_pub_t) > HEARTBEAT_S:
                 self._publish(API_MOVE, {"x": vx, "y": vy, "z": vyaw})
-                self._last_pub = cur
-                self._last_pub_t = now
+                self._last_pub, self._last_pub_t = cur, now
             self._was_moving = True
-        else:
-            # On transition to idle, send STOPMOVE (twice for robustness), then quiet.
-            if self._was_moving:
-                self._publish(API_STOPMOVE, {})
-                self._publish(API_STOPMOVE, {})
-                self._was_moving = False
-                self._last_pub = (None, None, None)
+        elif self._was_moving:
+            self._publish(API_STOPMOVE, {})
+            self._publish(API_STOPMOVE, {})
+            self._was_moving = False
+            self._last_pub = (None, None, None)
 
     def _publish(self, api_id, payload):
         req = Request()
@@ -223,116 +171,121 @@ class TeleopBridge(Node):
 
 
 # ---------------------------------------------------------------------------
-# HTTP server
+# WebRTC video track: latest ROS frame, paced to VIDEO_FPS
 # ---------------------------------------------------------------------------
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+class CameraTrack(VideoStreamTrack):
+    kind = "video"
 
-    def log_message(self, *args):  # silence per-request logging
-        pass
+    def __init__(self):
+        super().__init__()
+        self._n = 0
+        self._t0 = None
 
-    def _send(self, code, ctype, body, extra_headers=None):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        if extra_headers:
-            for k, v in extra_headers.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+    async def recv(self):
+        if self._t0 is None:
+            self._t0 = time.time()
+        self._n += 1
+        target = self._t0 + self._n / VIDEO_FPS
+        delay = target - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        with SHARED.frame_lock:
+            rgb = SHARED.rgb
+        if rgb is None:
+            rgb = np.zeros((240, 320, 3), dtype=np.uint8)
+        frame = VideoFrame.from_ndarray(rgb, format="rgb24")
+        frame.pts = self._n
+        frame.time_base = fractions.Fraction(1, VIDEO_FPS)
+        return frame
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
 
-        if path == "/" or path == "/index.html":
+# ---------------------------------------------------------------------------
+# aiohttp app: static + signaling
+# ---------------------------------------------------------------------------
+PCS = set()
+
+
+def _static_response(path):
+    rel = path.lstrip("/") or "index.html"
+    if ".." in rel:
+        return web.Response(status=403, text="nope")
+    full = os.path.realpath(os.path.join(WEB_DIR, rel))
+    if not full.startswith(WEB_DIR + os.sep) or not os.path.isfile(full):
+        return web.Response(status=404, text="not found")
+    ext = os.path.splitext(full)[1].lower()
+    with open(full, "rb") as f:
+        body = f.read()
+    return web.Response(body=body, content_type=_CONTENT_TYPES.get(ext, "application/octet-stream").split(";")[0])
+
+
+async def index(request):
+    return _static_response("/index.html")
+
+
+async def static_file(request):
+    return _static_response(request.path)
+
+
+async def cmd_http(request):
+    """Fire-and-forget HTTP control fallback: /cmd?vx=&vy=&vyaw="""
+    q = request.rel_url.query
+    try:
+        SHARED.set_cmd(q.get("vx", 0), q.get("vy", 0), q.get("vyaw", 0))
+    except (TypeError, ValueError):
+        return web.Response(status=400, text="bad")
+    return web.Response(text="ok")
+
+
+async def stop_http(request):
+    SHARED.set_cmd(0, 0, 0)
+    return web.Response(text="stopped")
+
+
+async def offer(request):
+    params = await request.json()
+    pc = RTCPeerConnection()
+    PCS.add(pc)
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        @channel.on("message")
+        def on_message(message):
             try:
-                with open(HTML_PATH, "rb") as f:
-                    body = f.read()
-            except FileNotFoundError:
-                body = b"<h1>index.html not found next to teleop_bridge.py</h1>"
-            self._send(200, "text/html; charset=utf-8", body)
-            return
+                d = json.loads(message)
+                SHARED.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("vyaw", 0))
+            except Exception:  # noqa: BLE001
+                pass
 
-        if path == "/cmd":
-            q = parse_qs(parsed.query)
-            try:
-                vx = _clamp(float(q.get("vx", ["0"])[0]), VX_MIN, VX_MAX)
-                vy = _clamp(float(q.get("vy", ["0"])[0]), -VY_MAX, VY_MAX)
-                vyaw = _clamp(float(q.get("vyaw", ["0"])[0]), -VYAW_MAX, VYAW_MAX)
-            except ValueError:
-                self._send(400, "text/plain", b"bad params")
-                return
-            with SHARED.cmd_lock:
-                SHARED.vx, SHARED.vy, SHARED.vyaw = vx, vy, vyaw
-                SHARED.cmd_t = time.monotonic()
-            self._send(200, "text/plain", b"ok")
-            return
+    @pc.on("connectionstatechange")
+    async def on_state():
+        if pc.connectionState in ("failed", "closed", "disconnected"):
+            await pc.close()
+            PCS.discard(pc)
+            SHARED.set_cmd(0, 0, 0)  # safety: stop if peer drops
 
-        if path == "/stop":
-            with SHARED.cmd_lock:
-                SHARED.vx = SHARED.vy = SHARED.vyaw = 0.0
-                SHARED.cmd_t = time.monotonic()
-            self._send(200, "text/plain", b"stopped")
-            return
-
-        if path == "/stream":
-            self._stream_mjpeg()
-            return
-
-        # Static files from web_teleop/ (e.g. /vr.html, /three.min.js).
-        if self._serve_static(path):
-            return
-
-        self._send(404, "text/plain", b"not found")
-
-    def _serve_static(self, path):
-        rel = path.lstrip("/")
-        if not rel or ".." in rel or rel.startswith("/"):
-            return False
-        full = os.path.realpath(os.path.join(WEB_DIR, rel))
-        if not full.startswith(WEB_DIR + os.sep) or not os.path.isfile(full):
-            return False
-        ext = os.path.splitext(full)[1].lower()
-        ctype = _CONTENT_TYPES.get(ext, "application/octet-stream")
-        with open(full, "rb") as f:
-            body = f.read()
-        self._send(200, ctype, body)
-        return True
-
-    def _stream_mjpeg(self):
-        self.send_response(200)
-        self.send_header(
-            "Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        self.send_header("Cache-Control", "no-cache, private")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        period = 1.0 / STREAM_FPS
-        try:
-            while True:
-                with SHARED.frame_lock:
-                    jpg = SHARED.jpeg
-                if jpg is not None:
-                    self.wfile.write(b"--frame\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                    self.wfile.write(
-                        f"Content-Length: {len(jpg)}\r\n\r\n".encode())
-                    self.wfile.write(jpg)
-                    self.wfile.write(b"\r\n")
-                time.sleep(period)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+    pc.addTrack(CameraTrack())
+    await pc.setRemoteDescription(
+        RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    return web.json_response(
+        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
 
-def _serve_http():
-    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
+def make_app():
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_post("/offer", offer)
+    app.router.add_get("/cmd", cmd_http)
+    app.router.add_get("/stop", stop_http)
+    app.router.add_get("/{name}", static_file)
+    return app
 
 
-def _ensure_cert():
-    """Generate a self-signed cert if missing. WebXR needs a secure context
-    (HTTPS) when the Quest connects over the LAN; the user clicks through the
-    self-signed warning once."""
+# ---------------------------------------------------------------------------
+# cert + startup
+# ---------------------------------------------------------------------------
+def ensure_cert():
     if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
         return True
     try:
@@ -340,37 +293,36 @@ def _ensure_cert():
             ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
              "-keyout", KEY_PATH, "-out", CERT_PATH, "-days", "365",
              "-subj", "/CN=go2w-teleop"],
-            check=True, capture_output=True, timeout=30,
-        )
+            check=True, capture_output=True, timeout=30)
         return True
     except Exception as e:  # noqa: BLE001
-        print(f"[teleop] HTTPS disabled — cert generation failed: {e}")
-        print("[teleop] The 2D page still works over HTTP; VR needs HTTPS.")
+        print(f"[teleop] cert gen failed, HTTPS/VR disabled: {e}")
         return False
 
 
-def _serve_https():
-    if not _ensure_cert():
-        return
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(CERT_PATH, KEY_PATH)
-    srv = ThreadingHTTPServer(("0.0.0.0", HTTPS_PORT), Handler)
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    srv.serve_forever()
+async def run_servers():
+    app = make_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # plain HTTP (2D + fallback)
+    await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
+    # HTTPS (required for WebXR secure context)
+    if ensure_cert():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+        await web.TCPSite(runner, "0.0.0.0", HTTPS_PORT, ssl_context=ctx).start()
+        print(f"[teleop] HTTPS :{HTTPS_PORT}  (VR: https://<ip>:{HTTPS_PORT}/vr.html)")
+    print(f"[teleop] HTTP  :{HTTP_PORT}  (2D: http://<ip>:{HTTP_PORT}/)")
+    while True:
+        await asyncio.sleep(3600)
 
 
 def main():
     rclpy.init()
-    node = TeleopBridge()
-    threading.Thread(target=_serve_http, daemon=True).start()
-    threading.Thread(target=_serve_https, daemon=True).start()
-    node.get_logger().info(
-        f"  2D page:  http://<laptop-ip>:{HTTP_PORT}/")
-    node.get_logger().info(
-        f"  VR page:  https://<laptop-ip>:{HTTPS_PORT}/vr.html  "
-        f"(accept the self-signed cert warning)")
+    node = TeleopNode()
+    threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
     try:
-        rclpy.spin(node)
+        asyncio.run(run_servers())
     except KeyboardInterrupt:
         pass
     finally:

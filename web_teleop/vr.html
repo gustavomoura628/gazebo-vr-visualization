@@ -14,7 +14,7 @@
   #enter { font-size:18px; font-weight:700; padding:16px 28px; border-radius:14px;
            border:none; background:#2dd4bf; color:#04201c; cursor:pointer; }
   #enter:disabled { background:#33414d; color:#7d8fa0; cursor:default; }
-  #preview { max-width:80vw; max-height:45vh; border-radius:10px; border:1px solid #232c36; background:#000; }
+  #video { max-width:70vw; max-height:42vh; border-radius:10px; border:1px solid #232c36; background:#000; }
   a { color:#2dd4bf; }
   #msg { font-size:13px; color:#7d8fa0; min-height:18px; }
 </style>
@@ -22,7 +22,7 @@
 <body>
 <div id="ui">
   <h1>Go2W Sim — VR Teleop</h1>
-  <img id="cam" src="/stream" alt="camera" crossorigin="anonymous" />
+  <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
   <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
@@ -30,118 +30,95 @@
 </div>
 
 <script src="/three.min.js"></script>
+<script src="/rtc.js"></script>
 <script>
-// ---- tuning (mirror the 2D page) ----
-const FWD = 0.46, BACK = -0.30, TURN = 1.80, DEAD = 0.12, SEND_HZ = 20;  // Create3 true max
+const FWD = 0.46, BACK = -0.30, TURN = 1.80, DEAD = 0.12, SEND_HZ = 20;
 
-const cam = document.getElementById('cam');
+const videoEl = document.getElementById('video');
 const enterBtn = document.getElementById('enter');
 const msg = document.getElementById('msg');
 
-let renderer, scene, camera, panel, tex;
-let lastSend = 0;
+let renderer, scene, camera, tex, channel = null, xrSession = null;
 
 function buildScene() {
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(70, 1, 0.05, 100);
-
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.xr.enabled = true;
-  renderer.xr.setReferenceSpaceType('local'); // eye-level origin
+  renderer.xr.setReferenceSpaceType('local');
   document.body.appendChild(renderer.domElement);
-  renderer.domElement.style.display = 'none'; // only shown in-session
+  renderer.domElement.style.display = 'none';
 
-  // Video panel: a 4:3 plane ~2 m in front, at eye level.
-  tex = new THREE.Texture(cam);
+  tex = new THREE.VideoTexture(videoEl);   // auto-updates each frame, hardware decoded
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
-  tex.generateMipmaps = false;
   const mat = new THREE.MeshBasicMaterial({ map: tex });
-  const w = 1.6, h = 1.2;
-  panel = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), mat);
   panel.position.set(0, 0, -2.0);
   scene.add(panel);
-
   scene.add(new THREE.AmbientLight(0xffffff, 1.0));
 }
 
+// Read thumbsticks straight from the gamepad — NOT inside the render loop, so
+// control timing is independent of frame rate / video.
 function readSticks() {
-  const session = renderer.xr.getSession();
-  if (!session) return null;
-  let vx = 0, vyaw = 0, strafe = 0;
-  for (const src of session.inputSources) {
+  let vx = 0, vyaw = 0;
+  if (!xrSession) return { vx, vyaw };
+  for (const src of xrSession.inputSources) {
     if (!src.gamepad) continue;
-    const ax = src.gamepad.axes; // [0,1]=touchpad (unused), [2,3]=thumbstick
+    const ax = src.gamepad.axes;
     const sx = ax.length > 2 ? ax[2] : (ax[0] || 0);
     const sy = ax.length > 3 ? ax[3] : (ax[1] || 0);
-    if (src.handedness === 'left') {
-      if (Math.abs(sy) > DEAD) vx = -sy * (sy < 0 ? FWD : -BACK); // up = forward
-      if (Math.abs(sx) > DEAD) strafe = sx * 0.2;
-    } else if (src.handedness === 'right') {
-      if (Math.abs(sx) > DEAD) vyaw = -sx * TURN; // push right = turn right (neg yaw)
-    }
+    if (src.handedness === 'left'  && Math.abs(sy) > DEAD) vx = -sy * (sy < 0 ? FWD : -BACK);
+    if (src.handedness === 'right' && Math.abs(sx) > DEAD) vyaw = -sx * TURN;
   }
-  return { vx, vy: strafe, vyaw };
+  return { vx, vyaw };
 }
 
-function sendCmd(c) {
-  fetch(`/cmd?vx=${c.vx.toFixed(3)}&vy=${c.vy.toFixed(3)}&vyaw=${c.vyaw.toFixed(3)}`).catch(()=>{});
-}
+// Independent control loop.
+setInterval(() => {
+  const { vx, vyaw } = readSticks();
+  sendControl(() => channel, vx, 0, vyaw);
+}, 1000 / SEND_HZ);
 
-function onFrame(t) {
-  // keep the video texture fresh from the MJPEG <img>
-  if (cam.complete && cam.naturalWidth > 0) tex.needsUpdate = true;
-  if (renderer.xr.isPresenting) {
-    const c = readSticks();
-    if (c && (t - lastSend) > (1000 / SEND_HZ)) {
-      sendCmd(c);
-      lastSend = t;
-    }
-  }
-  renderer.render(scene, camera);
-}
+function onFrame() { renderer.render(scene, camera); }  // render only
 
 async function enterVR() {
   try {
-    const session = await navigator.xr.requestSession('immersive-vr', {
-      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
-    });
+    await videoEl.play().catch(() => {});
+    xrSession = await navigator.xr.requestSession('immersive-vr',
+      { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
     renderer.domElement.style.display = 'block';
-    await renderer.xr.setSession(session);
+    await renderer.xr.setSession(xrSession);
     renderer.setAnimationLoop(onFrame);
-    msg.textContent = 'In VR. Take the headset — drive with the sticks.';
-    session.addEventListener('end', () => {
-      fetch('/stop').catch(()=>{});
+    msg.textContent = 'In VR — drive with the sticks.';
+    xrSession.addEventListener('end', () => {
+      sendControl(() => channel, 0, 0, 0);
       renderer.setAnimationLoop(null);
       renderer.domElement.style.display = 'none';
+      xrSession = null;
       msg.textContent = 'VR session ended.';
     });
-  } catch (e) {
-    msg.textContent = 'Failed to enter VR: ' + e;
-  }
+  } catch (e) { msg.textContent = 'Failed to enter VR: ' + e; }
 }
 
 async function init() {
   buildScene();
-  if (!navigator.xr) {
-    enterBtn.textContent = 'WebXR not available';
-    msg.textContent = 'Open this page in the Quest browser and try again.';
-    return;
-  }
+  try {
+    const { getChannel } = await connectWebRTC(videoEl);
+    channel = getChannel();
+  } catch (e) { msg.textContent = 'WebRTC failed: ' + e; }
+
+  if (!navigator.xr) { enterBtn.textContent = 'WebXR not available'; return; }
   const ok = await navigator.xr.isSessionSupported('immersive-vr').catch(() => false);
-  if (!ok) {
-    enterBtn.textContent = 'immersive-vr not supported';
-    return;
-  }
+  if (!ok) { enterBtn.textContent = 'immersive-vr not supported'; return; }
   enterBtn.disabled = false;
   enterBtn.textContent = 'Enter VR';
   enterBtn.addEventListener('click', enterVR);
-  // keep rendering (hidden) so the texture stays warm before entering
-  renderer.setAnimationLoop(onFrame);
+  renderer.setAnimationLoop(onFrame);  // keep rendering the preview before entering
 }
-
 init();
 </script>
 </body>

@@ -91,8 +91,17 @@ FROM base AS workspace
 
 # Quest teleop bridge (web_teleop/teleop_bridge.py). Added here, after the
 # expensive colcon build in `base`, so editing it doesn't bust the build cache.
-# Pillow is used by the bridge to JPEG-encode camera frames for the MJPEG stream.
-RUN pip3 install --no-cache-dir pillow
+# WebRTC stack: aiortc (UDP video track + control datachannel) + aiohttp
+# (signaling/static/HTTPS). av provides the video encoder; numpy for frames.
+RUN pip3 install --no-cache-dir aiortc aiohttp numpy
+
+# Bump the OAK-D sim camera from 320x240 to 640x480 for noticeably better image
+# quality (WebRTC handles the extra bitrate fine).
+RUN sed -i -E \
+    -e 's#<width>320</width>#<width>640</width>#' \
+    -e 's#<height>240</height>#<height>480</height>#' \
+    /opt/ros/humble/share/turtlebot4_description/urdf/sensors/oakd.urdf.xacro
+
 COPY web_teleop/ /web_teleop/
 
 # NOTE on speed: the TurtleBot4 is a Create3 base, hard-limited to ~0.46 m/s by

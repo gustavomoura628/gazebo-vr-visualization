@@ -13,10 +13,11 @@
   header { padding:8px 14px; display:flex; align-items:center; gap:14px;
            background:var(--panel); border-bottom:1px solid #232c36; }
   header h1 { font-size:15px; margin:0; font-weight:600; }
+  header a { color:var(--accent); font-size:13px; text-decoration:none; }
   #status { font-size:13px; color:#9fb0c0; margin-left:auto; font-variant-numeric:tabular-nums; }
   .stage { flex:1; display:flex; align-items:center; justify-content:center;
            background:#000; position:relative; overflow:hidden; }
-  #video { max-width:100%; max-height:100%; image-rendering:auto; }
+  #video { max-width:100%; max-height:100%; }
   .pad { display:grid; grid-template-columns:repeat(3,72px); grid-template-rows:repeat(2,72px);
          gap:8px; padding:14px; justify-content:center; background:var(--panel);
          border-top:1px solid #232c36; }
@@ -35,12 +36,12 @@
 <div class="wrap">
   <header>
     <h1>Go2W Sim Teleop</h1>
-    <a href="/vr.html" style="color:#2dd4bf;font-size:13px;text-decoration:none">Enter VR ▸</a>
+    <a href="/vr.html">Enter VR ▸</a>
     <div id="status">connecting…</div>
   </header>
 
   <div class="stage">
-    <img id="video" src="/stream" alt="camera stream" />
+    <video id="video" autoplay muted playsinline></video>
   </div>
 
   <div class="pad">
@@ -52,90 +53,73 @@
     <div class="btn" data-vyaw="-1">▶</div>
   </div>
   <div class="hint">
-    Keyboard: <b>W/S</b> fwd/back · <b>A/D</b> turn · <b>Q/E</b> strafe · hold buttons to drive.
-    Reverse is limited (robot dislikes backing up).
+    Keyboard: <b>W/S</b> fwd/back · <b>A/D</b> turn · hold buttons to drive.
+    Video over WebRTC, control over a separate data channel.
   </div>
 </div>
 
+<script src="/rtc.js"></script>
 <script>
-// ---- tuning ----
-const FWD = 0.46;     // m/s — Create3 base true max (with safety_override=full)
-const BACK = -0.30;   // m/s reverse
-const TURN = 1.80;    // rad/s — snappy turn
-const STRAFE = 0.0;   // diff-drive base can't strafe
-const SEND_HZ = 20;
-
-// ---- command state ----
-let vx = 0, vy = 0, vyaw = 0;
+const FWD = 0.46, BACK = -0.30, TURN = 1.80, SEND_HZ = 20;
+let vx = 0, vyaw = 0;
 const keys = {};
+let channel = null;
 
 function recompute() {
-  // keyboard contribution
-  let fx = 0, fy = 0, fz = 0;
+  let fx = 0, fz = 0;
   if (keys['w'] || keys['arrowup'])    fx += FWD;
   if (keys['s'] || keys['arrowdown'])  fx += BACK;
   if (keys['a'] || keys['arrowleft'])  fz += TURN;
   if (keys['d'] || keys['arrowright']) fz -= TURN;
-  if (keys['q']) fy += STRAFE;
-  if (keys['e']) fy -= STRAFE;
-  // button contribution (held)
   for (const b of document.querySelectorAll('.btn.on')) {
     if (b.dataset.vx)   fx += (+b.dataset.vx) * FWD;
     if (b.dataset.vyaw) fz += (+b.dataset.vyaw) * TURN;
   }
-  vx = fx; vy = fy; vyaw = fz;
+  vx = fx; vyaw = fz;
 }
 
-// ---- keyboard ----
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (['w','a','s','d','q','e','arrowup','arrowdown','arrowleft','arrowright'].includes(k)) {
+  if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright'].includes(k)) {
     keys[k] = true; recompute(); e.preventDefault();
   }
 });
-addEventListener('keyup', e => {
-  const k = e.key.toLowerCase();
-  if (k in keys) { keys[k] = false; recompute(); }
-});
+addEventListener('keyup', e => { const k=e.key.toLowerCase(); if (k in keys){ keys[k]=false; recompute(); } });
 
-// ---- on-screen buttons (pointer = works with mouse, touch, Quest trigger) ----
 for (const b of document.querySelectorAll('.btn')) {
-  const press = e => {
-    e.preventDefault();
-    if (b.dataset.stop) { stopAll(); return; }
-    b.classList.add('on'); recompute();
-  };
+  const press = e => { e.preventDefault(); if (b.dataset.stop){ stopAll(); return; } b.classList.add('on'); recompute(); };
   const release = e => { e.preventDefault(); b.classList.remove('on'); recompute(); };
   b.addEventListener('pointerdown', press);
   b.addEventListener('pointerup', release);
   b.addEventListener('pointerleave', release);
   b.addEventListener('pointercancel', release);
 }
-
 function stopAll() {
   for (const k in keys) keys[k] = false;
   for (const b of document.querySelectorAll('.btn.on')) b.classList.remove('on');
-  vx = vy = vyaw = 0;
-  fetch('/stop').catch(()=>{});
+  vx = vyaw = 0;
 }
 
-// ---- send loop ----
-let lastOk = 0;
-async function sendLoop() {
-  try {
-    const r = await fetch(`/cmd?vx=${vx.toFixed(3)}&vy=${vy.toFixed(3)}&vyaw=${vyaw.toFixed(3)}`);
-    if (r.ok) lastOk = performance.now();
-  } catch (e) { /* ignore */ }
-}
-setInterval(sendLoop, 1000 / SEND_HZ);
+// Control loop — independent of video / rendering.
+setInterval(() => { sendControl(() => channel, vx, 0, vyaw); }, 1000 / SEND_HZ);
 
-// ---- status ----
+// Status
+const statusEl = document.getElementById('status');
 setInterval(() => {
-  const age = performance.now() - lastOk;
-  const link = age < 500 ? 'OK' : 'no link';
-  document.getElementById('status').textContent =
-    `${link} · vx ${vx.toFixed(2)}  vyaw ${vyaw.toFixed(2)}`;
-}, 100);
+  const link = channel && channel.readyState === 'open' ? 'RTC' : 'http';
+  statusEl.textContent = `${link} · vx ${vx.toFixed(2)} vyaw ${vyaw.toFixed(2)}`;
+}, 150);
+
+// Connect
+(async () => {
+  try {
+    const { getChannel } = await connectWebRTC(document.getElementById('video'));
+    channel = getChannel();
+    statusEl.textContent = 'connected';
+  } catch (e) {
+    statusEl.textContent = 'WebRTC failed: ' + e;
+  }
+})();
 </script>
 </body>
 </html>

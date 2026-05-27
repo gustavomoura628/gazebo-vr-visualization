@@ -42,7 +42,10 @@ docker exec -it "${CONTAINER}" bash -lc "
     # Unlock the Create3 base's full speed (lifts the ~0.3 m/s safe-speed throttle
     # to the ~0.46 m/s max and disables the backup limit). Harmless if it's already set.
     echo 'Setting Create3 safety_override=full...'
-    ros2 param set /motion_control safety_override full 2>&1 | head -1 \
-        || echo '(could not set safety_override — is the sim fully up?)'
+    for i in 1 2 3 4 5; do
+        ros2 param set /motion_control safety_override full 2>&1 | grep -q successful \
+            && { echo '  safety_override=full set.'; break; }
+        echo '  (motion_control not ready, retrying...)'; sleep 2
+    done
     exec python3 /web_teleop/teleop_bridge.py
 "
