@@ -77,13 +77,22 @@ function readSticks() {
   return { vx, vyaw };
 }
 
-// Independent control loop.
-setInterval(() => {
+// Control is sent from the XR animation loop, NOT a setInterval — browsers
+// throttle setInterval during an immersive WebXR session, which made holding a
+// steady turn stutter. The XR loop is compositor-driven (~72-90 Hz, rock-steady),
+// and since the WebRTC VideoTexture updates itself, the loop never blocks on video.
+// Outside a session we still tick via setInterval so the 2D preview can drive.
+let lastSentT = 0;
+function tickControl(t) {
   const { vx, vyaw } = readSticks();
   sendControl(() => channel, vx, 0, vyaw);
-}, 1000 / SEND_HZ);
+}
+setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
-function onFrame() { renderer.render(scene, camera); }  // render only
+function onFrame(t) {
+  tickControl(t);              // steady control, driven by the XR compositor
+  renderer.render(scene, camera);
+}
 
 async function enterVR() {
   try {

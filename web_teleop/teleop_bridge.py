@@ -69,7 +69,8 @@ VX_MIN = -0.4
 VY_MAX = 0.1
 VYAW_MAX = 2.2
 
-CMD_TIMEOUT = 0.4
+CMD_TIMEOUT = 0.75   # watchdog: stop if no control for this long (widened to avoid
+                     # stop/go stutter when control updates briefly lag)
 PUBLISH_HZ = 10.0
 HEARTBEAT_S = 0.3
 VIDEO_FPS = 30
