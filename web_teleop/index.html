@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Go2W Sim Teleop</title>
+<style>
+  :root { --accent:#2dd4bf; --bg:#0b0f14; --panel:#151c24; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:#e6edf3;
+              font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { display:flex; flex-direction:column; height:100%; }
+  header { padding:8px 14px; display:flex; align-items:center; gap:14px;
+           background:var(--panel); border-bottom:1px solid #232c36; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  #status { font-size:13px; color:#9fb0c0; margin-left:auto; font-variant-numeric:tabular-nums; }
+  .stage { flex:1; display:flex; align-items:center; justify-content:center;
+           background:#000; position:relative; overflow:hidden; }
+  #video { max-width:100%; max-height:100%; image-rendering:auto; }
+  .pad { display:grid; grid-template-columns:repeat(3,72px); grid-template-rows:repeat(2,72px);
+         gap:8px; padding:14px; justify-content:center; background:var(--panel);
+         border-top:1px solid #232c36; }
+  .btn { display:flex; align-items:center; justify-content:center; user-select:none;
+         border-radius:12px; background:#1f2a35; border:1px solid #2c3a47; color:#e6edf3;
+         font-size:24px; font-weight:700; touch-action:none; cursor:pointer; }
+  .btn:active, .btn.on { background:var(--accent); color:#04201c; }
+  .btn.stop { background:#3a1f24; border-color:#5a2a30; font-size:14px; }
+  .btn.stop:active { background:#ef4444; color:#fff; }
+  .hint { padding:6px 14px 12px; font-size:12px; color:#7d8fa0; text-align:center;
+          background:var(--panel); }
+  .hint b { color:#9fb0c0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Go2W Sim Teleop</h1>
+    <div id="status">connecting…</div>
+  </header>
+
+  <div class="stage">
+    <img id="video" src="/stream" alt="camera stream" />
+  </div>
+
+  <div class="pad">
+    <div></div>
+    <div class="btn" data-vx="1">▲</div>
+    <div></div>
+    <div class="btn" data-vyaw="1">◀</div>
+    <div class="btn stop" data-stop="1">STOP</div>
+    <div class="btn" data-vyaw="-1">▶</div>
+  </div>
+  <div class="hint">
+    Keyboard: <b>W/S</b> fwd/back · <b>A/D</b> turn · <b>Q/E</b> strafe · hold buttons to drive.
+    Reverse is limited (robot dislikes backing up).
+  </div>
+</div>
+
+<script>
+// ---- tuning ----
+const FWD = 0.40;     // m/s forward when held
+const BACK = -0.12;   // m/s reverse (limited; backup-limit reflex)
+const TURN = 0.80;    // rad/s
+const STRAFE = 0.20;  // m/s
+const SEND_HZ = 20;
+
+// ---- command state ----
+let vx = 0, vy = 0, vyaw = 0;
+const keys = {};
+
+function recompute() {
+  // keyboard contribution
+  let fx = 0, fy = 0, fz = 0;
+  if (keys['w'] || keys['arrowup'])    fx += FWD;
+  if (keys['s'] || keys['arrowdown'])  fx += BACK;
+  if (keys['a'] || keys['arrowleft'])  fz += TURN;
+  if (keys['d'] || keys['arrowright']) fz -= TURN;
+  if (keys['q']) fy += STRAFE;
+  if (keys['e']) fy -= STRAFE;
+  // button contribution (held)
+  for (const b of document.querySelectorAll('.btn.on')) {
+    if (b.dataset.vx)   fx += (+b.dataset.vx) * FWD;
+    if (b.dataset.vyaw) fz += (+b.dataset.vyaw) * TURN;
+  }
+  vx = fx; vy = fy; vyaw = fz;
+}
+
+// ---- keyboard ----
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (['w','a','s','d','q','e','arrowup','arrowdown','arrowleft','arrowright'].includes(k)) {
+    keys[k] = true; recompute(); e.preventDefault();
+  }
+});
+addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  if (k in keys) { keys[k] = false; recompute(); }
+});
+
+// ---- on-screen buttons (pointer = works with mouse, touch, Quest trigger) ----
+for (const b of document.querySelectorAll('.btn')) {
+  const press = e => {
+    e.preventDefault();
+    if (b.dataset.stop) { stopAll(); return; }
+    b.classList.add('on'); recompute();
+  };
+  const release = e => { e.preventDefault(); b.classList.remove('on'); recompute(); };
+  b.addEventListener('pointerdown', press);
+  b.addEventListener('pointerup', release);
+  b.addEventListener('pointerleave', release);
+  b.addEventListener('pointercancel', release);
+}
+
+function stopAll() {
+  for (const k in keys) keys[k] = false;
+  for (const b of document.querySelectorAll('.btn.on')) b.classList.remove('on');
+  vx = vy = vyaw = 0;
+  fetch('/stop').catch(()=>{});
+}
+
+// ---- send loop ----
+let lastOk = 0;
+async function sendLoop() {
+  try {
+    const r = await fetch(`/cmd?vx=${vx.toFixed(3)}&vy=${vy.toFixed(3)}&vyaw=${vyaw.toFixed(3)}`);
+    if (r.ok) lastOk = performance.now();
+  } catch (e) { /* ignore */ }
+}
+setInterval(sendLoop, 1000 / SEND_HZ);
+
+// ---- status ----
+setInterval(() => {
+  const age = performance.now() - lastOk;
+  const link = age < 500 ? 'OK' : 'no link';
+  document.getElementById('status').textContent =
+    `${link} · vx ${vx.toFixed(2)}  vyaw ${vyaw.toFixed(2)}`;
+}, 100);
+</script>
+</body>
+</html>
