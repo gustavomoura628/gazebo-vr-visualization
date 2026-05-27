@@ -89,6 +89,12 @@ USER $USERNAME
 # ---
 FROM base AS workspace
 
+# Quest teleop bridge (web_teleop/teleop_bridge.py). Added here, after the
+# expensive colcon build in `base`, so editing it doesn't bust the build cache.
+# Pillow is used by the bridge to JPEG-encode camera frames for the MJPEG stream.
+RUN pip3 install --no-cache-dir pillow
+COPY web_teleop/ /web_teleop/
+
 # Set the entrypoint to source the workspace setup script
 ENTRYPOINT ["/bin/bash", "-c", "source /opt/ros/$ROS_DISTRO/setup.bash && source $ROS_WS/install/setup.bash && exec \"$@\"", "--"]
 CMD ["bash"]
