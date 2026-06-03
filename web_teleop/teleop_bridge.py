@@ -59,8 +59,14 @@ HTTPS_PORT = 8443
 CERT_PATH = "/tmp/teleop_cert.pem"
 KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
-SCAN_TOPIC = "/scan"  # 2D LaserScan — DEAD in this sim (gpu_lidar returns all zeros)
-CLOUD_TOPIC = "/oakd/rgb/preview/depth/points"  # depth-camera 3D cloud (real data)
+# Point-cloud source. Default = the real 3D lidar (rplidar made 3D + OGRE2 fix).
+# Override to the depth camera with:
+#   CLOUD_TOPIC=/oakd/rgb/preview/depth/points CLOUD_FRAME=optical
+# CLOUD_FRAME selects the axis remap to robot frame (x fwd, y left, z up):
+#   "lidar"   -> identity (gz gpu_lidar points are already in the sensor body frame)
+#   "optical" -> rx=oz, ry=-ox, rz=-oy (depth-camera optical frame: x right,y down,z fwd)
+CLOUD_TOPIC = os.environ.get("CLOUD_TOPIC", "/lidar/points")
+CLOUD_FRAME = os.environ.get("CLOUD_FRAME", "lidar")
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 
 # Point streaming. We push the latest 3D points (packed float32 XYZ, robot frame)
@@ -227,9 +233,12 @@ class TeleopNode(Node):
             raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(H, W, step)
             xyz = raw[:, :, 0:12].copy().view(np.float32).reshape(H, W, 3)
             sr = max(1, int(np.sqrt(H * W / CLOUD_MAX_PTS)))
-            g = xyz[::sr, ::sr]                          # (h, w, 3) optical, subsampled
+            g = xyz[::sr, ::sr]                          # (h, w, 3) subsampled
             ox, oy, oz = g[..., 0], g[..., 1], g[..., 2]
-            rob = np.stack([oz, -ox, -oy], axis=-1)      # (h, w, 3) robot frame
+            if CLOUD_FRAME == "optical":                 # depth camera
+                rob = np.stack([oz, -ox, -oy], axis=-1)  # optical -> robot frame
+            else:                                        # lidar: already body frame
+                rob = g                                  # (h, w, 3) robot frame
             dist = np.sqrt((rob * rob).sum(axis=-1))     # (h, w)
             valid = np.isfinite(dist)
             d = np.where(valid, dist, 0.0).astype(np.float32)

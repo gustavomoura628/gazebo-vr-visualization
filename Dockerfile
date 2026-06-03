@@ -110,6 +110,14 @@ RUN sed -i -E \
 RUN sed -i "s/' -r',/' -r --render-engine-server ogre2',/" \
     /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
 
+# Make the rplidar a 3D lidar: the shared ray_sensor macro already supports
+# vertical params, so just pass 16 rings over a +-15 deg vertical FOV. A gpu_lidar
+# with vertical>1 auto-publishes an organized 3D PointCloud2 on
+# .../rplidar/scan/points (bridged to /lidar/points in our launch). Stand-in for
+# the real MID-360.
+RUN sed -i 's# h_samples="640"# h_samples="640" v_samples="16" v_min_angle="-0.262" v_max_angle="0.262"#' \
+    /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro
+
 COPY web_teleop/ /web_teleop/
 
 # NOTE on speed: the TurtleBot4 is a Create3 base, hard-limited to ~0.46 m/s by
