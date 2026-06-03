@@ -70,6 +70,9 @@ SPORT_REQUEST_TOPIC = "/api/sport/request"
 # real MID-360 / a fixed gpu_lidar is just changing the subscription + frame map.
 LIDAR_PERIOD_MS = 100   # 10 Hz
 CLOUD_MAX_PTS = 1500    # subsample the 307k-pt depth cloud to keep bandwidth sane
+EDL_STRENGTH = 2.0      # Eye-Dome Lighting: higher = stronger edge darkening
+EDL_MIN = 0.12          # shade floor so edges aren't pure black
+EDGE_JUMP = 0.25        # depth jump (m) above which a normal is rejected (edge)
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -210,21 +213,55 @@ class TeleopNode(Node):
             self.get_logger().warn(f"scan convert failed: {e}")
 
     def _on_cloud(self, msg: PointCloud2):
-        # Depth-camera PointCloud2 -> packed float32 XYZ in ROBOT frame, so the
-        # browser's robot->VR remap (-y, z, -x) renders it correctly.
-        # Camera optical frame is (x right, y down, z forward); robot frame is
-        # (x fwd, y left, z up) => rx=oz, ry=-ox, rz=-oy.
+        # Depth-camera PointCloud2 -> blob of, per point:
+        #   [float32 XYZ robot frame] [uint8 EDL shade] [int8 x3 normal]
+        #   laid out as 3 contiguous sections: all XYZ, then all shade, then all normals.
+        # We keep the organized HxW grid so we can compute, from grid neighbours,
+        # both Eye-Dome Lighting (edge darkening) and surface normals (cross product).
+        # Optical frame (x right, y down, z fwd) -> robot frame (rx=oz, ry=-ox,
+        # rz=-oy) so the browser's existing remap + orientation fix still apply.
         try:
-            step = msg.point_step
-            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(-1, step)
-            stride = max(1, raw.shape[0] // CLOUD_MAX_PTS)
-            raw = raw[::stride]
-            xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)  # x,y,z @ 0,4,8
-            ok = np.isfinite(xyz).all(axis=1)
-            xyz = xyz[ok]
-            ox, oy, oz = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-            pts = np.stack([oz, -ox, -oy], axis=1).astype("<f4")  # -> robot frame
-            SHARED.set_lidar(pts.tobytes(), pts.shape[0])
+            H, W, step = msg.height, msg.width, msg.point_step
+            if H <= 1:
+                return  # need an organized cloud for neighbour-based shading
+            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(H, W, step)
+            xyz = raw[:, :, 0:12].copy().view(np.float32).reshape(H, W, 3)
+            sr = max(1, int(np.sqrt(H * W / CLOUD_MAX_PTS)))
+            g = xyz[::sr, ::sr]                          # (h, w, 3) optical, subsampled
+            ox, oy, oz = g[..., 0], g[..., 1], g[..., 2]
+            rob = np.stack([oz, -ox, -oy], axis=-1)      # (h, w, 3) robot frame
+            dist = np.sqrt((rob * rob).sum(axis=-1))     # (h, w)
+            valid = np.isfinite(dist)
+            d = np.where(valid, dist, 0.0).astype(np.float32)
+
+            # --- EDL: response = sum over 4 grid neighbours of max(0, d - d_neighbour)
+            resp = np.zeros_like(d)
+            for ax, sgn in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                dn = np.roll(d, sgn, axis=ax)
+                vn = np.roll(valid, sgn, axis=ax)
+                resp += np.where(vn, np.maximum(0.0, d - dn), 0.0)
+            shade = np.clip(np.exp(-EDL_STRENGTH * resp), EDL_MIN, 1.0)
+
+            # --- Normals: cross product of right/down neighbour edge vectors.
+            robz = np.where(valid[..., None], rob, 0.0)
+            e1 = np.roll(robz, -1, axis=1) - robz       # toward next column (right)
+            e2 = np.roll(robz, -1, axis=0) - robz       # toward next row (down)
+            nrm = np.cross(e1, e2)
+            nl = np.sqrt((nrm * nrm).sum(-1, keepdims=True))
+            nrm = nrm / (nl + 1e-9)
+            # reject normals spanning an edge or an invalid neighbour (-> zero = unlit)
+            dR = np.abs(np.roll(d, -1, axis=1) - d)
+            dD = np.abs(np.roll(d, -1, axis=0) - d)
+            bad = (~np.roll(valid, -1, axis=1)) | (~np.roll(valid, -1, axis=0)) \
+                | (dR > EDGE_JUMP) | (dD > EDGE_JUMP)
+            nrm[bad] = 0.0
+
+            vf = valid.reshape(-1)
+            robf = rob.reshape(-1, 3)[vf].astype("<f4")
+            shf = (shade.reshape(-1)[vf] * 255).astype(np.uint8)
+            nf = np.clip(np.round(nrm.reshape(-1, 3)[vf] * 127), -127, 127).astype(np.int8)
+            blob = robf.tobytes() + shf.tobytes() + nf.tobytes()   # 12N + N + 3N = 16N
+            SHARED.set_lidar(blob, robf.shape[0])
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"cloud convert failed: {e}")
 
