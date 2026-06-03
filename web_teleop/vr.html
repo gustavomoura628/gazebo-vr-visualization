@@ -42,8 +42,8 @@ let renderer, scene, camera, tex, channel = null, xrSession = null;
 
 // --- lidar ---
 const LIDAR_MAXPTS = 4000;     // hard cap on rendered points
-const LIDAR_SCALE = 0.25;      // shrink the real-world ring into the playspace
-let lidarGeo = null, lidarPos = null;
+const LIDAR_DMAX = 6.0;        // distance (m) mapped to the "far"/blue end of the gradient
+let lidarGeo = null, lidarPos = null, lidarCol = null;
 let lidarBytes = 0, lidarBytesRate = 0, lidarPts = 0;   // bandwidth tracking
 let hudCanvas = null, hudCtx = null, hudTex = null;
 let videoPanel = null, lidarCloud = null;               // toggled by controller
@@ -69,16 +69,27 @@ function buildScene() {
   scene.add(videoPanel);
   scene.add(new THREE.AmbientLight(0xffffff, 1.0));
 
-  // Lidar point cloud — a 360° ring of dots around the user (covers what the
-  // camera panel doesn't). Robot frame is remapped to VR in onLidar().
+  // 3D point cloud, rendered at TRUE 1:1 metric scale, centered on the user's
+  // head (= the robot camera origin). A point N metres ahead of the camera shows
+  // N metres ahead in VR. Per-vertex colour = distance gradient (red near→blue far).
   lidarGeo = new THREE.BufferGeometry();
   lidarPos = new Float32Array(LIDAR_MAXPTS * 3);
+  lidarCol = new Float32Array(LIDAR_MAXPTS * 3);
   lidarGeo.setAttribute('position', new THREE.BufferAttribute(lidarPos, 3));
+  lidarGeo.setAttribute('color', new THREE.BufferAttribute(lidarCol, 3));
   lidarGeo.setDrawRange(0, 0);
-  const lmat = new THREE.PointsMaterial({ size: 0.04, color: 0x39ff14, sizeAttenuation: true });
+  const lmat = new THREE.PointsMaterial({ size: 0.035, vertexColors: true, sizeAttenuation: true });
   lidarCloud = new THREE.Points(lidarGeo, lmat);
-  lidarCloud.position.set(0, -0.4, 0);     // sit around/below eye level
-  lidarCloud.scale.setScalar(LIDAR_SCALE);
+  lidarCloud.position.set(0, 0, 0);        // 1:1 metric, no offset
+  lidarCloud.scale.setScalar(1.0);
+  // The depth cloud arrives rotated vs the VR head frame. Correction derived
+  // from the observed misalignment ("yaw right 90 + roll left-ear-down 90"):
+  // apply Rx(-90) then Ry(+90). Tweak these two angles if it's still off.
+  {
+    const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0),  Math.PI / 2);
+    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0),  Math.PI / 2);
+    lidarCloud.quaternion.copy(qy.multiply(qx)); // qy*qx => apply qx first, then qy
+  }
   scene.add(lidarCloud);
   applyMode();
 
@@ -107,21 +118,29 @@ function drawHud() {
 }
 
 // Incoming packed float32 XYZ (robot frame: x fwd, y left, z up) -> VR frame
-// (x right, y up, z back). Cheap per-point remap; only newest scan is kept.
+// (x right, y up, z back). Per point we also set a distance-gradient colour:
+// near = red, far = blue. Only the newest cloud is kept.
 function onLidar(buf) {
   lidarBytes += buf.byteLength;
   const src = new Float32Array(buf);
   const n = Math.min((src.length / 3) | 0, LIDAR_MAXPTS);
   for (let i = 0; i < n; i++) {
     const rx = src[i*3], ry = src[i*3+1], rz = src[i*3+2];
-    lidarPos[i*3]   = -ry;   // VR x (right)  = -robot y (left)
-    lidarPos[i*3+1] =  rz;   // VR y (up)     =  robot z (up)
-    lidarPos[i*3+2] = -rx;   // VR z (back)   = -robot x (fwd)
+    lidarPos[i*3]     = -ry;   // VR x (right) = -robot y (left)
+    lidarPos[i*3 + 1] =  rz;   // VR y (up)    =  robot z (up)
+    lidarPos[i*3 + 2] = -rx;   // VR z (back)  = -robot x (fwd)
+    // distance gradient: red (near) -> green (mid) -> blue (far)
+    const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
+    const t = Math.min(d / LIDAR_DMAX, 1.0);
+    lidarCol[i*3]     = 1.0 - t;                       // R high when near
+    lidarCol[i*3 + 1] = 1.0 - Math.abs(t - 0.5) * 2;   // G peaks mid
+    lidarCol[i*3 + 2] = t;                             // B high when far
   }
   lidarPts = n;
   if (lidarGeo) {
     lidarGeo.setDrawRange(0, n);
     lidarGeo.attributes.position.needsUpdate = true;
+    lidarGeo.attributes.color.needsUpdate = true;
   }
 }
 
@@ -163,15 +182,10 @@ function tickControl(t) {
 }
 setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
-// Show video panel XOR the 3D point cloud.
+// Show video panel XOR the 3D point cloud (cloud stays at true 1:1 scale).
 function applyMode() {
   if (videoPanel) videoPanel.visible = !showPoints;
-  if (lidarCloud) {
-    lidarCloud.visible = showPoints;
-    // bigger + centered at eye level when it's the main view
-    lidarCloud.scale.setScalar(showPoints ? LIDAR_SCALE * 2.2 : LIDAR_SCALE);
-    lidarCloud.position.set(0, showPoints ? 0 : -0.4, showPoints ? -1.0 : 0);
-  }
+  if (lidarCloud) lidarCloud.visible = showPoints;
 }
 
 // A/X button (buttons[4]) toggles video <-> points, edge-detected so one press
