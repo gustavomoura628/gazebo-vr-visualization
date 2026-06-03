@@ -102,6 +102,14 @@ RUN sed -i -E \
     -e 's#<height>240</height>#<height>480</height>#' \
     /opt/ros/humble/share/turtlebot4_description/urdf/sensors/oakd.urdf.xacro
 
+# Force the sim SERVER's sensor rendering to OGRE2. The default fell back to
+# OGRE1 (couldn't get a GL3.3 context), and OGRE1 silently breaks GPU lidar
+# (all gpu_lidar sensors return 0). OGRE2 needs a real GL3.3+ context, which we
+# get by rendering on the NVIDIA GPU (run with --gpus all; see run_simulation.sh).
+# Patch the hardcoded ign_args in ignition.launch.py to add the engine flag.
+RUN sed -i "s/' -r',/' -r --render-engine-server ogre2',/" \
+    /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
+
 COPY web_teleop/ /web_teleop/
 
 # NOTE on speed: the TurtleBot4 is a Create3 base, hard-limited to ~0.46 m/s by
