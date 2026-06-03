@@ -115,6 +115,7 @@ function buildScene() {
   sphereMesh.quaternion.copy(lidarCloud.quaternion);
   scene.add(sphereMesh);
 
+  buildControllers();
   applyMode();
 
   // In-VR bandwidth HUD: a small canvas-textured plane under the video panel.
@@ -127,6 +128,26 @@ function buildScene() {
   hud.position.set(0, -0.78, -2.0);
   scene.add(hud);
   drawHud();
+}
+
+// Tracked controllers: a laser ray + a tip dot per hand, so you can point at
+// things during demos. three.js auto-updates these groups' poses each XR frame.
+function buildControllers() {
+  const rayGeo = new THREE.BufferGeometry().setFromPoints(
+    [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+  for (let i = 0; i < 2; i++) {
+    const ctrl = renderer.xr.getController(i);          // targetRay space (aim)
+    const ray = new THREE.Line(rayGeo, new THREE.LineBasicMaterial({ color: 0x2dd4bf }));
+    ray.scale.z = 5;                                    // 5 m laser
+    ctrl.add(ray);
+    ctrl.add(new THREE.Mesh(new THREE.SphereGeometry(0.012),
+      new THREE.MeshBasicMaterial({ color: 0x2dd4bf }))); // tip dot
+    scene.add(ctrl);
+    const grip = renderer.xr.getControllerGrip(i);      // grip space (hand)
+    grip.add(new THREE.Mesh(new THREE.SphereGeometry(0.022),
+      new THREE.MeshBasicMaterial({ color: 0xdddddd })));
+    scene.add(grip);
+  }
 }
 
 function drawHud() {
