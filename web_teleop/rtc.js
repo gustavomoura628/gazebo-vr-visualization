@@ -3,10 +3,11 @@
 // - Opens an unreliable/unordered "ctl" DataChannel for control (UDP-like,
 //   decoupled from video, never head-of-line-blocked).
 //
-// connectWebRTC(videoEl) -> { pc, getChannel() }
+// connectWebRTC(videoEl, opts) -> { pc, getChannel() }
+//   opts.onLidar(ArrayBuffer)  // called with each packed float32 XYZ scan blob
 // sendControl(getChannel, vx, vy, vyaw)  // fire-and-forget; HTTP fallback
 
-async function connectWebRTC(videoEl) {
+async function connectWebRTC(videoEl, opts = {}) {
   const pc = new RTCPeerConnection({
     // local LAN only; no STUN/TURN needed
     iceServers: [],
@@ -14,6 +15,12 @@ async function connectWebRTC(videoEl) {
 
   // Control channel: unreliable + unordered => lowest latency, latest-wins.
   const ctl = pc.createDataChannel('ctl', { ordered: false, maxRetransmits: 0 });
+
+  // Lidar channel: server -> browser point blobs. Unreliable/unordered; we only
+  // ever want the freshest scan, so a dropped one is fine.
+  const lidar = pc.createDataChannel('lidar', { ordered: false, maxRetransmits: 0 });
+  lidar.binaryType = 'arraybuffer';
+  lidar.onmessage = (e) => { if (opts.onLidar) opts.onLidar(e.data); };
 
   // We only receive video.
   pc.addTransceiver('video', { direction: 'recvonly' });

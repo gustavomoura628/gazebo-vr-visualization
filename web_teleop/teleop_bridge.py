@@ -44,7 +44,7 @@ from rclpy.node import Node
 from rclpy.qos import (
     QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy,
 )
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from unitree_api.msg import Request
 
 from aiohttp import web
@@ -59,7 +59,17 @@ HTTPS_PORT = 8443
 CERT_PATH = "/tmp/teleop_cert.pem"
 KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
+SCAN_TOPIC = "/scan"  # 2D LaserScan — DEAD in this sim (gpu_lidar returns all zeros)
+CLOUD_TOPIC = "/oakd/rgb/preview/depth/points"  # depth-camera 3D cloud (real data)
 SPORT_REQUEST_TOPIC = "/api/sport/request"
+
+# Point streaming. We push the latest 3D points (packed float32 XYZ, robot frame)
+# over a dedicated DataChannel every LIDAR_PERIOD_MS. This period is the future
+# "throttle" knob: drop the rate and do movement-prediction on top of the dots.
+# Source today is the depth camera (the sim's rplidar is broken); swapping in the
+# real MID-360 / a fixed gpu_lidar is just changing the subscription + frame map.
+LIDAR_PERIOD_MS = 100   # 10 Hz
+CLOUD_MAX_PTS = 1500    # subsample the 307k-pt depth cloud to keep bandwidth sane
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -101,6 +111,11 @@ class Shared:
         self.n_msgs = 0
         self.n_zero = 0
         self.n_nonzero = 0
+        # lidar: latest packed float32 XYZ blob (robot frame) + bytes-sent counter
+        self.lidar_lock = threading.Lock()
+        self.lidar_blob = None
+        self.lidar_npts = 0
+        self.lidar_bytes_sent = 0  # rolling, reset by take_stats
 
     def set_cmd(self, vx, vy, vyaw):
         with self.cmd_lock:
@@ -118,7 +133,23 @@ class Shared:
         with self.cmd_lock:
             s = (self.n_msgs, self.n_zero, self.n_nonzero, self.vx, self.vyaw)
             self.n_msgs = self.n_zero = self.n_nonzero = 0
-            return s
+        with self.lidar_lock:
+            lb = self.lidar_bytes_sent
+            self.lidar_bytes_sent = 0
+        return s + (lb,)
+
+    def set_lidar(self, blob, npts):
+        with self.lidar_lock:
+            self.lidar_blob = blob
+            self.lidar_npts = npts
+
+    def get_lidar(self):
+        with self.lidar_lock:
+            return self.lidar_blob
+
+    def add_lidar_bytes(self, n):
+        with self.lidar_lock:
+            self.lidar_bytes_sent += n
 
 
 SHARED = Shared()
@@ -136,6 +167,7 @@ class TeleopNode(Node):
             history=HistoryPolicy.KEEP_LAST, depth=2,
         )
         self.create_subscription(Image, CAMERA_TOPIC, self._on_image, cam_qos)
+        self.create_subscription(PointCloud2, CLOUD_TOPIC, self._on_cloud, cam_qos)
         self.pub = self.create_publisher(Request, SPORT_REQUEST_TOPIC, 10)
         self.create_timer(1.0 / PUBLISH_HZ, self._tick)
         self._last_pub = (None, None, None)
@@ -158,6 +190,43 @@ class TeleopNode(Node):
                 SHARED.rgb = np.ascontiguousarray(rgb)
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"image convert failed: {e}")
+
+    def _on_scan(self, msg: LaserScan):
+        # LaserScan -> XYZ points in the robot/lidar frame (x fwd, y left, z up).
+        # z=0 (single ring today); a real 3D lidar would fill z. Packed float32
+        # XYZ triplets, little-endian, ready to ship straight to the browser.
+        try:
+            ranges = np.asarray(msg.ranges, dtype=np.float32)
+            n = ranges.size
+            ang = msg.angle_min + np.arange(n, dtype=np.float32) * msg.angle_increment
+            ok = np.isfinite(ranges) & (ranges >= msg.range_min) & (ranges <= msg.range_max)
+            r, a = ranges[ok], ang[ok]
+            x = r * np.cos(a)
+            y = r * np.sin(a)
+            z = np.zeros_like(x)
+            pts = np.stack([x, y, z], axis=1).astype("<f4")
+            SHARED.set_lidar(pts.tobytes(), pts.shape[0])
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"scan convert failed: {e}")
+
+    def _on_cloud(self, msg: PointCloud2):
+        # Depth-camera PointCloud2 -> packed float32 XYZ in ROBOT frame, so the
+        # browser's robot->VR remap (-y, z, -x) renders it correctly.
+        # Camera optical frame is (x right, y down, z forward); robot frame is
+        # (x fwd, y left, z up) => rx=oz, ry=-ox, rz=-oy.
+        try:
+            step = msg.point_step
+            raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(-1, step)
+            stride = max(1, raw.shape[0] // CLOUD_MAX_PTS)
+            raw = raw[::stride]
+            xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)  # x,y,z @ 0,4,8
+            ok = np.isfinite(xyz).all(axis=1)
+            xyz = xyz[ok]
+            ox, oy, oz = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+            pts = np.stack([oz, -ox, -oy], axis=1).astype("<f4")  # -> robot frame
+            SHARED.set_lidar(pts.tobytes(), pts.shape[0])
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"cloud convert failed: {e}")
 
     def _tick(self):
         with SHARED.cmd_lock:
@@ -183,13 +252,15 @@ class TeleopNode(Node):
         self._log_ticks += 1
         if self._log_ticks >= int(PUBLISH_HZ):
             self._log_ticks = 0
-            n, z, nz, lvx, lvyaw = SHARED.take_stats()
+            n, z, nz, lvx, lvyaw, lbytes = SHARED.take_stats()
             npeers = len(PCS)
-            if n > 0 or npeers > 1:
+            if n > 0 or npeers > 1 or lbytes > 0:
                 flag = "  <-- MULTIPLE PEERS (control conflict?)" if npeers > 1 else ""
+                kbit = lbytes * 8 / 1000.0
                 self.get_logger().info(
                     f"[ctl] peers={npeers} {n}/s (zero {z}/nonzero {nz}) "
-                    f"vx={lvx:.2f} vyaw={lvyaw:.2f}{flag}")
+                    f"vx={lvx:.2f} vyaw={lvyaw:.2f} | lidar {kbit:.0f} kbit/s "
+                    f"({SHARED.lidar_npts} pts){flag}")
 
     def _publish(self, api_id, payload):
         req = Request()
@@ -278,13 +349,27 @@ async def offer(request):
 
     @pc.on("datachannel")
     def on_datachannel(channel):
-        @channel.on("message")
-        def on_message(message):
-            try:
-                d = json.loads(message)
-                SHARED.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("vyaw", 0))
-            except Exception:  # noqa: BLE001
-                pass
+        if channel.label == "ctl":
+            @channel.on("message")
+            def on_message(message):
+                try:
+                    d = json.loads(message)
+                    SHARED.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("vyaw", 0))
+                except Exception:  # noqa: BLE001
+                    pass
+        elif channel.label == "lidar":
+            # Server -> browser: push the latest scan blob every LIDAR_PERIOD_MS.
+            async def lidar_loop():
+                while channel.readyState == "open":
+                    blob = SHARED.get_lidar()
+                    if blob:
+                        try:
+                            channel.send(blob)
+                            SHARED.add_lidar_bytes(len(blob))
+                        except Exception:  # noqa: BLE001
+                            break
+                    await asyncio.sleep(LIDAR_PERIOD_MS / 1000.0)
+            asyncio.ensure_future(lidar_loop())
 
     @pc.on("connectionstatechange")
     async def on_state():

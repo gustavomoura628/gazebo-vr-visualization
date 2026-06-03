@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X button toggles video / 3D points.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -39,6 +39,15 @@ const enterBtn = document.getElementById('enter');
 const msg = document.getElementById('msg');
 
 let renderer, scene, camera, tex, channel = null, xrSession = null;
+
+// --- lidar ---
+const LIDAR_MAXPTS = 4000;     // hard cap on rendered points
+const LIDAR_SCALE = 0.25;      // shrink the real-world ring into the playspace
+let lidarGeo = null, lidarPos = null;
+let lidarBytes = 0, lidarBytesRate = 0, lidarPts = 0;   // bandwidth tracking
+let hudCanvas = null, hudCtx = null, hudTex = null;
+let videoPanel = null, lidarCloud = null;               // toggled by controller
+let showPoints = false, prevToggleBtn = false;          // A/X button edge-detect
 
 function buildScene() {
   scene = new THREE.Scene();
@@ -55,11 +64,76 @@ function buildScene() {
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
   const mat = new THREE.MeshBasicMaterial({ map: tex });
-  const panel = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), mat);
-  panel.position.set(0, 0, -2.0);
-  scene.add(panel);
+  videoPanel = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), mat);
+  videoPanel.position.set(0, 0, -2.0);
+  scene.add(videoPanel);
   scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+  // Lidar point cloud — a 360° ring of dots around the user (covers what the
+  // camera panel doesn't). Robot frame is remapped to VR in onLidar().
+  lidarGeo = new THREE.BufferGeometry();
+  lidarPos = new Float32Array(LIDAR_MAXPTS * 3);
+  lidarGeo.setAttribute('position', new THREE.BufferAttribute(lidarPos, 3));
+  lidarGeo.setDrawRange(0, 0);
+  const lmat = new THREE.PointsMaterial({ size: 0.04, color: 0x39ff14, sizeAttenuation: true });
+  lidarCloud = new THREE.Points(lidarGeo, lmat);
+  lidarCloud.position.set(0, -0.4, 0);     // sit around/below eye level
+  lidarCloud.scale.setScalar(LIDAR_SCALE);
+  scene.add(lidarCloud);
+  applyMode();
+
+  // In-VR bandwidth HUD: a small canvas-textured plane under the video panel.
+  hudCanvas = document.createElement('canvas');
+  hudCanvas.width = 512; hudCanvas.height = 96;
+  hudCtx = hudCanvas.getContext('2d');
+  hudTex = new THREE.CanvasTexture(hudCanvas);
+  const hud = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.225),
+    new THREE.MeshBasicMaterial({ map: hudTex, transparent: true }));
+  hud.position.set(0, -0.78, -2.0);
+  scene.add(hud);
+  drawHud();
 }
+
+function drawHud() {
+  if (!hudCtx) return;
+  hudCtx.clearRect(0, 0, 512, 96);
+  hudCtx.fillStyle = 'rgba(11,15,20,0.85)';
+  hudCtx.fillRect(0, 0, 512, 96);
+  hudCtx.fillStyle = '#39ff14';
+  hudCtx.font = 'bold 34px system-ui, sans-serif';
+  hudCtx.fillText(`lidar ${lidarPts} pts`, 16, 40);
+  hudCtx.fillText(`${(lidarBytesRate * 8 / 1000).toFixed(0)} kbit/s`, 16, 82);
+  hudTex.needsUpdate = true;
+}
+
+// Incoming packed float32 XYZ (robot frame: x fwd, y left, z up) -> VR frame
+// (x right, y up, z back). Cheap per-point remap; only newest scan is kept.
+function onLidar(buf) {
+  lidarBytes += buf.byteLength;
+  const src = new Float32Array(buf);
+  const n = Math.min((src.length / 3) | 0, LIDAR_MAXPTS);
+  for (let i = 0; i < n; i++) {
+    const rx = src[i*3], ry = src[i*3+1], rz = src[i*3+2];
+    lidarPos[i*3]   = -ry;   // VR x (right)  = -robot y (left)
+    lidarPos[i*3+1] =  rz;   // VR y (up)     =  robot z (up)
+    lidarPos[i*3+2] = -rx;   // VR z (back)   = -robot x (fwd)
+  }
+  lidarPts = n;
+  if (lidarGeo) {
+    lidarGeo.setDrawRange(0, n);
+    lidarGeo.attributes.position.needsUpdate = true;
+  }
+}
+
+// Bandwidth meter: once a second, snapshot bytes -> rate, refresh the HUD.
+setInterval(() => {
+  lidarBytesRate = lidarBytes;
+  lidarBytes = 0;
+  drawHud();
+  if (!xrSession) {
+    msg.textContent = `lidar ${lidarPts} pts · ${(lidarBytesRate*8/1000).toFixed(0)} kbit/s`;
+  }
+}, 1000);
 
 // Read thumbsticks straight from the gamepad — NOT inside the render loop, so
 // control timing is independent of frame rate / video.
@@ -89,8 +163,33 @@ function tickControl(t) {
 }
 setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
+// Show video panel XOR the 3D point cloud.
+function applyMode() {
+  if (videoPanel) videoPanel.visible = !showPoints;
+  if (lidarCloud) {
+    lidarCloud.visible = showPoints;
+    // bigger + centered at eye level when it's the main view
+    lidarCloud.scale.setScalar(showPoints ? LIDAR_SCALE * 2.2 : LIDAR_SCALE);
+    lidarCloud.position.set(0, showPoints ? 0 : -0.4, showPoints ? -1.0 : 0);
+  }
+}
+
+// A/X button (buttons[4]) toggles video <-> points, edge-detected so one press
+// = one toggle.
+function checkToggle() {
+  if (!xrSession) return;
+  let pressed = false;
+  for (const src of xrSession.inputSources) {
+    const b = src.gamepad && src.gamepad.buttons;
+    if (b && (b[4]?.pressed || b[5]?.pressed)) pressed = true;
+  }
+  if (pressed && !prevToggleBtn) { showPoints = !showPoints; applyMode(); }
+  prevToggleBtn = pressed;
+}
+
 function onFrame(t) {
   tickControl(t);              // steady control, driven by the XR compositor
+  checkToggle();
   renderer.render(scene, camera);
 }
 
@@ -116,7 +215,7 @@ async function enterVR() {
 async function init() {
   buildScene();
   try {
-    const { getChannel } = await connectWebRTC(videoEl);
+    const { getChannel } = await connectWebRTC(videoEl, { onLidar });
     channel = getChannel();
   } catch (e) { msg.textContent = 'WebRTC failed: ' + e; }
 
