@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X toggles camera / 3D lidar.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X cycles camera / both / top / bottom lidar.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -46,8 +46,8 @@ const LIDAR_DMAX = 6.0;        // distance (m) -> far/blue end of the colour gra
 let lidarBytes = 0, lidarBytesRate = 0, lidarPts = 0;   // bandwidth tracking
 let hudCanvas = null, hudCtx = null, hudTex = null;
 let videoPanel = null;
-// A/X cycles: 0 = camera (video), 1 = 3D lidar (lit spheres)
-const MODE_NAMES = ['camera', 'spheres'];
+// A/X cycles: 0 camera, 1 both lidars, 2 top lidar only, 3 bottom lidar only
+const MODE_NAMES = ['camera', 'both', 'top', 'bottom'];
 let mode = 0, prevToggleBtn = false;
 const SPHERE_R = 0.03;          // sphere radius (m)
 let sphereMesh = null;
@@ -138,25 +138,32 @@ function drawHud() {
   hudTex.needsUpdate = true;
 }
 
-// Blob = [N float32 XYZ robot frame]. Remap robot->VR (x right, y up, z back)
-// and render lit instanced spheres coloured by distance (red near -> blue far).
+// Blob = [uint32 n_top][float32 XYZ top...][float32 XYZ bottom...] (robot frame).
+// Remap robot->VR (x right, y up, z back), lit spheres coloured by distance.
+// mode 2 = top only, 3 = bottom only, 1 = both.
 function onLidar(buf) {
   lidarBytes += buf.byteLength;
-  const N = Math.floor(buf.byteLength / 12);   // 3 float32 per point
-  if (N <= 0 || !sphereMesh) return;
-  const xyz = new Float32Array(buf, 0, N * 3);
-  const n = Math.min(N, LIDAR_MAXPTS);
-  for (let i = 0; i < n; i++) {
+  if (buf.byteLength < 4 || !sphereMesh) return;
+  const nTop = new DataView(buf).getUint32(0, true);
+  const N = Math.floor((buf.byteLength - 4) / 12);   // points after the header
+  const xyz = new Float32Array(buf, 4, N * 3);
+  // pick the index range for the current mode
+  let start = 0, end = N;
+  if (mode === 2) { start = 0; end = Math.min(nTop, N); }        // top
+  else if (mode === 3) { start = Math.min(nTop, N); end = N; }   // bottom
+  const count = Math.min(end - start, LIDAR_MAXPTS);
+  for (let j = 0; j < count; j++) {
+    const i = start + j;
     const rx = xyz[i*3], ry = xyz[i*3+1], rz = xyz[i*3+2];
     _posV.set(-ry, rz, -rx);               // robot -> VR-local (right, up, back)
     _m4.compose(_posV, _quatI, _scaleV);
-    sphereMesh.setMatrixAt(i, _m4);
+    sphereMesh.setMatrixAt(j, _m4);
     const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
     const t = Math.min(d / LIDAR_DMAX, 1.0);
-    sphereMesh.setColorAt(i, _col.setRGB(1 - t, 1 - Math.abs(t - 0.5) * 2, t));
+    sphereMesh.setColorAt(j, _col.setRGB(1 - t, 1 - Math.abs(t - 0.5) * 2, t));
   }
-  lidarPts = n;
-  sphereMesh.count = n;
+  lidarPts = count;
+  sphereMesh.count = count;
   sphereMesh.instanceMatrix.needsUpdate = true;
   if (sphereMesh.instanceColor) sphereMesh.instanceColor.needsUpdate = true;
 }
@@ -199,10 +206,10 @@ function tickControl(t) {
 }
 setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
-// mode 0 = video panel; mode 1 = 3D lidar spheres.
+// mode 0 = video panel; modes 1-3 = 3D lidar spheres (both / top / bottom).
 function applyMode() {
   if (videoPanel) videoPanel.visible = (mode === 0);
-  if (sphereMesh) sphereMesh.visible = (mode === 1);
+  if (sphereMesh) sphereMesh.visible = (mode >= 1);
 }
 
 // A/X button (buttons[4]/[5]) cycles camera -> distance -> EDL -> normals,

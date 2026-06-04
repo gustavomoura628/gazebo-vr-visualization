@@ -95,12 +95,14 @@ if os.environ.get("CLOUD_TOPIC"):
     LIDAR_SOURCES = [(os.environ["CLOUD_TOPIC"], os.environ.get("CLOUD_FRAME", "optical"))]
 else:
     LIDAR_SOURCES = [("/lidar/points", "lidar_top"), ("/lidar/points2", "lidar_bottom")]
+LIDAR_KEYS = [k for _, k in LIDAR_SOURCES]   # order: [top, bottom] for the 2-lidar case
 
 LIDAR_PERIOD_MS = 100   # 10 Hz (the future throttle / prediction knob)
-CLOUD_MAX_PTS = 1200    # subsample target PER source (pre-cull). Merged + culled
-                        # stays ~1.2k pts (~14 KB/msg) — small enough for the
-                        # unreliable datachannel (large messages drop on the Quest).
-MIN_RANGE = 0.5         # cull points closer than this (m) -> removes robot self-hits
+CLOUD_MAX_PTS = 850     # subsample target PER source (pre-cull); merged stays
+                        # ~16 KB/msg — small enough for the unreliable datachannel.
+MIN_RANGE = 0.15        # cull only point-blank noise (m). NOT a self-hit filter:
+                        # self-returns are left visible so the top/bottom diagnostic
+                        # modes can show them (the mount is bad because TB4 != dog).
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -175,14 +177,18 @@ class Shared:
             self.lidar_clouds[key] = arr
 
     def get_lidar(self):
-        # Merge all sources' latest body-frame points into one float32 XYZ blob.
+        # Merge sources (in LIDAR_KEYS order: top first, bottom second) into one
+        # blob: [uint32 n_top][float32 XYZ top...][float32 XYZ bottom...]. The
+        # header lets the browser show top / bottom / both for diagnostics.
         with self.lidar_lock:
-            arrs = [a for a in self.lidar_clouds.values() if a is not None and a.size]
-        if not arrs:
+            clouds = [(k, self.lidar_clouds.get(k)) for k in LIDAR_KEYS]
+        clouds = [(k, c) for k, c in clouds if c is not None and c.size]
+        if not clouds:
             return None
-        allpts = np.concatenate(arrs, axis=0).astype("<f4")
+        n_top = clouds[0][1].shape[0]
+        allpts = np.concatenate([c for _, c in clouds], axis=0).astype("<f4")
         self.lidar_npts = allpts.shape[0]
-        return allpts.tobytes()
+        return np.uint32(n_top).tobytes() + allpts.tobytes()
 
     def add_lidar_bytes(self, n):
         with self.lidar_lock:
