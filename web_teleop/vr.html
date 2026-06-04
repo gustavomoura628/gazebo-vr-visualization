@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X cycles camera / both / top / bottom lidar. B/Y toggles the robot model.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A cycles lidar mode (camera/both/top/bottom). X cycles point shape (ico20/geo32/dod36/octa/cube). Y toggles flat/smooth shading. B toggles the robot model.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -46,14 +46,21 @@ const LIDAR_DMAX = 6.0;        // distance (m) -> far/blue end of the colour gra
 let lidarBytes = 0, lidarBytesRate = 0, lidarPts = 0;   // bandwidth tracking
 let hudCanvas = null, hudCtx = null, hudTex = null;
 let videoPanel = null;
-// A/X cycles: 0 camera, 1 both lidars, 2 top lidar only, 3 bottom lidar only
+// A cycles: 0 camera, 1 both lidars, 2 top lidar only, 3 bottom lidar only
 const MODE_NAMES = ['camera', 'both', 'top', 'bottom'];
-let mode = 0, prevModeBtn = false, prevRobotBtn = false;
-const SPHERE_R = 0.03;          // sphere radius (m)
-let sphereMesh = null;
+let mode = 0, prevModeBtn = false, prevRobotBtn = false, prevShapeBtn = false, prevFlatBtn = false;
+let pmat = null;                // shared point material (Y toggles flat/smooth shading)
+let flatShade = true;
+const POINT_R = 0.03;           // point half-size (m); baked into each geometry
+// X cycles the point shape so we can A/B them live in the headset.
+const SHAPE_NAMES = ['ico20', 'geo32', 'dod36', 'octa', 'cube'];
+let shapeIdx = 0;
+let shapeMeshes = [];           // one InstancedMesh per shape; only the active is shown
+let sphereMesh = null;          // == the active shape mesh (onLidar writes to it)
+let lastLidarBuf = null;        // last cloud, so shape/mode switches re-render instantly
 const _m4 = new THREE.Matrix4(), _posV = new THREE.Vector3();
-const _scaleV = new THREE.Vector3(SPHERE_R, SPHERE_R, SPHERE_R);
-const _quatI = new THREE.Quaternion(), _col = new THREE.Color();
+const _scaleV = new THREE.Vector3(1, 1, 1);   // size is baked into the geometry
+const _quatI = new THREE.Quaternion();
 
 // Viewpoint: the head sits at the robot CENTRE (body x=0,y=0), EYE_UP metres up.
 // Reference space is 'local', so the head origin == body origin; subtracting EYE_UP
@@ -91,16 +98,43 @@ function buildScene() {
   dir.position.set(0.4, 0.8, 0.6);
   scene.add(dir);
 
-  // 3D lidar cloud, lit instanced spheres at TRUE 1:1 metric scale, centred on the
-  // head, coloured by distance. The bridge delivers points already in the robot
-  // BODY frame (x fwd, y left, z up), so onLidar only does the fixed body->VR remap
-  // (-ry, rz, -rx) — no quaternion here.
-  const sgeo = new THREE.SphereGeometry(1, 6, 4);   // low-poly; scaled per instance
-  const smat = new THREE.MeshLambertMaterial();
-  sphereMesh = new THREE.InstancedMesh(sgeo, smat, LIDAR_MAXPTS);
-  sphereMesh.count = 0;
-  sphereMesh.frustumCulled = false;
-  scene.add(sphereMesh);
+  // 3D lidar cloud as REAL instanced low-poly solids. Billboard impostors looked
+  // like flat upright cards in the periphery (screen-aligned, don't face the eye),
+  // so we use honest geometry: correct from any eye angle, intersect with real
+  // depth, flat-shaded by the scene lights. Three shapes are built; X cycles them
+  // live so we can pick the best look. The bridge delivers BODY-frame points;
+  // onLidar writes one instance matrix per point (bodyToVR remap). Size is baked in.
+  // NOTE: MeshLambertMaterial ignores material.flatShading (it's Gouraud/per-vertex),
+  // so flat vs smooth is controlled by the geometry's NORMALS, not the material. For
+  // each shape we precompute BOTH a flat (per-face) and a smooth (radial = normalized
+  // position, the true sphere normal) normal set; the Y toggle (setFlat) swaps them.
+  pmat = new THREE.MeshLambertMaterial({ color: 0x9fd0ff });
+  const geoms = [
+    new THREE.IcosahedronGeometry(POINT_R, 0),                       // 20 tris, d20, even
+    new THREE.OctahedronGeometry(POINT_R, 1),                        // 32 tris, geodesic (roundest <40)
+    new THREE.DodecahedronGeometry(POINT_R, 0),                      // 36 tris, d12, gemmy
+    new THREE.OctahedronGeometry(POINT_R, 0),                        // 8 tris, gem/d8
+    new THREE.BoxGeometry(POINT_R * 1.5, POINT_R * 1.5, POINT_R * 1.5), // 12 tris, voxel
+  ];
+  for (const g of geoms) {
+    g.computeVertexNormals();                          // per-face FLAT normals (non-indexed)
+    const flatN = g.attributes.normal.array.slice();
+    const p = g.attributes.position, smoothN = new Float32Array(p.count * 3);
+    for (let i = 0; i < p.count; i++) {                // radial = smooth sphere normal
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i), L = Math.hypot(x, y, z) || 1;
+      smoothN[i*3] = x/L; smoothN[i*3+1] = y/L; smoothN[i*3+2] = z/L;
+    }
+    g.userData = { flatN, smoothN };                   // flatShade defaults true -> start flat
+  }
+  shapeMeshes = geoms.map((g) => {
+    const m = new THREE.InstancedMesh(g, pmat, LIDAR_MAXPTS);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.visible = false;
+    scene.add(m);
+    return m;
+  });
+  sphereMesh = shapeMeshes[shapeIdx];
 
   buildRobot();
   buildControllers();
@@ -180,39 +214,41 @@ function drawHud() {
   hudCtx.fillRect(0, 0, 512, 96);
   hudCtx.fillStyle = '#39ff14';
   hudCtx.font = 'bold 34px system-ui, sans-serif';
-  hudCtx.fillText(`${MODE_NAMES[mode]}  ·  ${lidarPts} pts`, 16, 40);
+  hudCtx.fillText(`${MODE_NAMES[mode]} · ${SHAPE_NAMES[shapeIdx]} ${flatShade ? 'flat' : 'smooth'} · ${lidarPts} pts`, 16, 40);
   hudCtx.fillText(`${(lidarBytesRate * 8 / 1000).toFixed(0)} kbit/s`, 16, 82);
   hudTex.needsUpdate = true;
 }
 
 // Blob = [uint32 n_top][float32 XYZ top...][float32 XYZ bottom...] (robot frame).
-// Remap robot->VR (x right, y up, z back), lit spheres coloured by distance.
 // mode 2 = top only, 3 = bottom only, 1 = both.
 function onLidar(buf) {
   lidarBytes += buf.byteLength;
-  if (buf.byteLength < 4 || !sphereMesh) return;
+  if (buf.byteLength < 4) return;
+  lastLidarBuf = buf;                        // cache so shape/mode switches re-render
+  renderCloud();
+}
+
+// Write one instance matrix per point into the ACTIVE shape mesh, for the cached
+// cloud + current mode. Called on each new cloud and on shape/mode switches.
+function renderCloud() {
+  const buf = lastLidarBuf;
+  if (!buf || !sphereMesh) return;
   const nTop = new DataView(buf).getUint32(0, true);
   const N = Math.floor((buf.byteLength - 4) / 12);   // points after the header
   const xyz = new Float32Array(buf, 4, N * 3);
-  // pick the index range for the current mode
   let start = 0, end = N;
   if (mode === 2) { start = 0; end = Math.min(nTop, N); }        // top
   else if (mode === 3) { start = Math.min(nTop, N); end = N; }   // bottom
   const count = Math.min(end - start, LIDAR_MAXPTS);
   for (let j = 0; j < count; j++) {
     const i = start + j;
-    const rx = xyz[i*3], ry = xyz[i*3+1], rz = xyz[i*3+2];
-    bodyToVR(rx, ry, rz, _posV);           // robot -> VR (right, up, back), eye at EYE_UP
+    bodyToVR(xyz[i*3], xyz[i*3+1], xyz[i*3+2], _posV);  // robot -> VR, eye at EYE_UP
     _m4.compose(_posV, _quatI, _scaleV);
     sphereMesh.setMatrixAt(j, _m4);
-    const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
-    const t = Math.min(d / LIDAR_DMAX, 1.0);
-    sphereMesh.setColorAt(j, _col.setRGB(1 - t, 1 - Math.abs(t - 0.5) * 2, t));
   }
   lidarPts = count;
   sphereMesh.count = count;
   sphereMesh.instanceMatrix.needsUpdate = true;
-  if (sphereMesh.instanceColor) sphereMesh.instanceColor.needsUpdate = true;
 }
 
 // Bandwidth meter: once a second, snapshot bytes -> rate, refresh the HUD.
@@ -253,26 +289,54 @@ function tickControl(t) {
 }
 setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
-// mode 0 = video panel; modes 1-3 = 3D lidar spheres (both / top / bottom).
+// mode 0 = video panel; modes 1-3 = 3D lidar points (both / top / bottom). Only the
+// active shape mesh is shown, and only when a lidar mode is selected.
 function applyMode() {
   if (videoPanel) videoPanel.visible = (mode === 0);
-  if (sphereMesh) sphereMesh.visible = (mode >= 1);
+  for (let i = 0; i < shapeMeshes.length; i++)
+    shapeMeshes[i].visible = (i === shapeIdx && mode >= 1);
 }
 
-// A/X (button 4) cycles camera/both/top/bottom lidar; B/Y (button 5) toggles the
-// robot model. Both edge-detected so one press = one step.
+// Switch the active point shape and repopulate it from the cached cloud.
+function setShape(idx) {
+  shapeIdx = idx;
+  sphereMesh = shapeMeshes[idx];
+  applyMode();
+  renderCloud();
+  drawHud();
+}
+
+// Flip flat/smooth shading by swapping each geometry's precomputed normal set
+// (Lambert is Gouraud, so shading follows the normals, not material.flatShading).
+function setFlat(on) {
+  flatShade = on;
+  for (const m of shapeMeshes) {
+    const g = m.geometry, ud = g.userData;
+    if (!ud || !ud.flatN) continue;
+    g.attributes.normal.array.set(on ? ud.flatN : ud.smoothN);
+    g.attributes.normal.needsUpdate = true;
+  }
+  drawHud();
+}
+
+// Left controller:  X (btn4) cycles point shape, Y (btn5) toggles flat/smooth.
+// Right controller: A (btn4) cycles lidar mode,  B (btn5) toggles the robot model.
+// All edge-detected so one press = one step.
 function checkToggle() {
   if (!xrSession) return;
-  let modeBtn = false, robotBtn = false;
+  let shapeBtn = false, modeBtn = false, flatBtn = false, robotBtn = false;
   for (const src of xrSession.inputSources) {
     const b = src.gamepad && src.gamepad.buttons;
     if (!b) continue;
-    if (b[4]?.pressed) modeBtn = true;   // A / X
-    if (b[5]?.pressed) robotBtn = true;  // B / Y
+    const left = src.handedness === 'left';
+    if (b[4]?.pressed) { if (left) shapeBtn = true; else modeBtn = true; }
+    if (b[5]?.pressed) { if (left) flatBtn  = true; else robotBtn = true; }
   }
-  if (modeBtn && !prevModeBtn) { mode = (mode + 1) % MODE_NAMES.length; applyMode(); }
+  if (modeBtn  && !prevModeBtn)  { mode = (mode + 1) % MODE_NAMES.length; applyMode(); renderCloud(); }
+  if (shapeBtn && !prevShapeBtn) setShape((shapeIdx + 1) % SHAPE_NAMES.length);
+  if (flatBtn  && !prevFlatBtn)  setFlat(!flatShade);
   if (robotBtn && !prevRobotBtn && robotModel) robotModel.visible = !robotModel.visible;
-  prevModeBtn = modeBtn; prevRobotBtn = robotBtn;
+  prevModeBtn = modeBtn; prevShapeBtn = shapeBtn; prevFlatBtn = flatBtn; prevRobotBtn = robotBtn;
 }
 
 function onFrame(t) {
