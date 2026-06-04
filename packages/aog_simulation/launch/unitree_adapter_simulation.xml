@@ -12,10 +12,15 @@
     <!-- <arg name="use_respawn" value="true"/> -->
   </include>
 
-  <!-- Bridge the 3D lidar point cloud (rplidar made 3D in the Dockerfile) from gz
-       to ROS as /lidar/points. The bringup only bridges the 2D LaserScan /scan. -->
+  <!-- Bridge the two 3D lidar point clouds (rplidar=top, lidar_bottom=bottom, both
+       made 3D in the Dockerfile) from gz to ROS as /lidar/points + /lidar/points2.
+       The bringup only bridges the 2D LaserScan /scan. -->
   <node pkg="ros_gz_bridge" exec="parameter_bridge" name="lidar_points_bridge" output="screen"
         args="/world/warehouse/model/turtlebot4/link/rplidar_link/sensor/rplidar/scan/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked">
     <remap from="/world/warehouse/model/turtlebot4/link/rplidar_link/sensor/rplidar/scan/points" to="/lidar/points"/>
+  </node>
+  <node pkg="ros_gz_bridge" exec="parameter_bridge" name="lidar_points2_bridge" output="screen"
+        args="/world/warehouse/model/turtlebot4/link/lidar_bottom_link/sensor/lidar_bottom/scan/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked">
+    <remap from="/world/warehouse/model/turtlebot4/link/lidar_bottom_link/sensor/lidar_bottom/scan/points" to="/lidar/points2"/>
   </node>
 </launch>

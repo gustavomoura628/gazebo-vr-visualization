@@ -59,23 +59,45 @@ HTTPS_PORT = 8443
 CERT_PATH = "/tmp/teleop_cert.pem"
 KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
-# Point-cloud source. Default = the real 3D lidar (rplidar made 3D + OGRE2 fix).
-# Override to the depth camera with:
-#   CLOUD_TOPIC=/oakd/rgb/preview/depth/points CLOUD_FRAME=optical
-# CLOUD_FRAME selects the axis remap to robot frame (x fwd, y left, z up):
-#   "lidar"   -> identity (gz gpu_lidar points are already in the sensor body frame)
-#   "optical" -> rx=oz, ry=-ox, rz=-oy (depth-camera optical frame: x right,y down,z fwd)
-CLOUD_TOPIC = os.environ.get("CLOUD_TOPIC", "/lidar/points")
-CLOUD_FRAME = os.environ.get("CLOUD_FRAME", "lidar")
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 
-# Point streaming. We push the latest 3D points (packed float32 XYZ, robot frame)
-# over a dedicated DataChannel every LIDAR_PERIOD_MS. This period is the future
-# "throttle" knob: drop the rate and do movement-prediction on top of the dots.
-# Source today is the depth camera (the sim's rplidar is broken); swapping in the
-# real MID-360 / a fixed gpu_lidar is just changing the subscription + frame map.
-LIDAR_PERIOD_MS = 100   # 10 Hz
-CLOUD_MAX_PTS = 1500    # subsample target to keep streamed-point bandwidth sane
+# Two MID-360 stand-in lidars (matching the real robot: a top one mounted normally
+# and a bottom one mounted upside-down, both tilted forward). Each cloud is
+# transformed from its sensor frame to the common robot BODY frame (x fwd, y left,
+# z up) before merging, so the browser just does a fixed body->VR remap (no
+# per-source rotation there).
+# These tilts MUST MATCH the xacro mount (top_lidar_pitch / bottom_lidar_pitch).
+TOP_LIDAR_PITCH = 0.30      # rad, forward tilt
+BOTTOM_LIDAR_PITCH = 0.30   # rad, forward tilt
+
+
+def _rpy_R(roll, pitch, yaw):
+    # Fixed-axis RPY -> R = Rz(yaw) @ Ry(pitch) @ Rx(roll). Maps a vector from the
+    # sensor frame into the robot body frame (same convention as URDF <origin rpy>).
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).astype(np.float32)
+
+
+# sensor-frame -> body-frame rotation per source key.
+_SOURCE_ROT = {
+    "lidar_top":    _rpy_R(0.0,     TOP_LIDAR_PITCH,    np.pi / 2),
+    "lidar_bottom": _rpy_R(np.pi,   BOTTOM_LIDAR_PITCH, np.pi / 2),
+}
+
+# Sources = list of (ros_topic, key). Default: the two lidars. Single depth-camera
+# fallback via env:  CLOUD_TOPIC=/oakd/rgb/preview/depth/points CLOUD_FRAME=optical
+if os.environ.get("CLOUD_TOPIC"):
+    LIDAR_SOURCES = [(os.environ["CLOUD_TOPIC"], os.environ.get("CLOUD_FRAME", "optical"))]
+else:
+    LIDAR_SOURCES = [("/lidar/points", "lidar_top"), ("/lidar/points2", "lidar_bottom")]
+
+LIDAR_PERIOD_MS = 100   # 10 Hz (the future throttle / prediction knob)
+CLOUD_MAX_PTS = 1500    # subsample target PER source, to keep bandwidth sane
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -117,9 +139,10 @@ class Shared:
         self.n_msgs = 0
         self.n_zero = 0
         self.n_nonzero = 0
-        # lidar: latest packed float32 XYZ blob (robot frame) + bytes-sent counter
+        # lidar: latest body-frame points per source (key -> np.float32 (N,3)),
+        # merged on demand. + bytes-sent counter for the log.
         self.lidar_lock = threading.Lock()
-        self.lidar_blob = None
+        self.lidar_clouds = {}
         self.lidar_npts = 0
         self.lidar_bytes_sent = 0  # rolling, reset by take_stats
 
@@ -144,14 +167,19 @@ class Shared:
             self.lidar_bytes_sent = 0
         return s + (lb,)
 
-    def set_lidar(self, blob, npts):
+    def set_lidar_cloud(self, key, arr):
         with self.lidar_lock:
-            self.lidar_blob = blob
-            self.lidar_npts = npts
+            self.lidar_clouds[key] = arr
 
     def get_lidar(self):
+        # Merge all sources' latest body-frame points into one float32 XYZ blob.
         with self.lidar_lock:
-            return self.lidar_blob
+            arrs = [a for a in self.lidar_clouds.values() if a is not None and a.size]
+        if not arrs:
+            return None
+        allpts = np.concatenate(arrs, axis=0).astype("<f4")
+        self.lidar_npts = allpts.shape[0]
+        return allpts.tobytes()
 
     def add_lidar_bytes(self, n):
         with self.lidar_lock:
@@ -173,7 +201,10 @@ class TeleopNode(Node):
             history=HistoryPolicy.KEEP_LAST, depth=2,
         )
         self.create_subscription(Image, CAMERA_TOPIC, self._on_image, cam_qos)
-        self.create_subscription(PointCloud2, CLOUD_TOPIC, self._on_cloud, cam_qos)
+        for topic, key in LIDAR_SOURCES:
+            self.create_subscription(
+                PointCloud2, topic,
+                lambda msg, k=key: self._on_cloud(msg, k), cam_qos)
         self.pub = self.create_publisher(Request, SPORT_REQUEST_TOPIC, 10)
         self.create_timer(1.0 / PUBLISH_HZ, self._tick)
         self._last_pub = (None, None, None)
@@ -215,12 +246,11 @@ class TeleopNode(Node):
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"scan convert failed: {e}")
 
-    def _on_cloud(self, msg: PointCloud2):
-        # PointCloud2 -> blob of packed float32 XYZ (robot frame), 12 bytes/point.
-        # (We dropped EDL/normals, so no organized-grid processing is needed — the
-        # cloud is rendered as lit spheres, coloured by distance in the browser.)
-        # Frame: lidar gpu_lidar points are already body frame (x fwd, y left, z up);
-        # the depth-camera fallback is optical (x right, y down, z fwd) -> remap.
+    def _on_cloud(self, msg: PointCloud2, key: str):
+        # PointCloud2 -> latest body-frame float32 XYZ for this source.
+        # Each source is transformed to the common robot body frame so the merged
+        # cloud is coherent: lidars via their mount rotation (_SOURCE_ROT), the
+        # depth-camera fallback via the optical-axis remap.
         try:
             step = msg.point_step
             raw = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(-1, step)
@@ -228,13 +258,14 @@ class TeleopNode(Node):
             raw = raw[::sr]                              # (blue-noise replaces this in Step 2)
             xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)
             xyz = xyz[np.isfinite(xyz).all(axis=1)]
-            if CLOUD_FRAME == "optical":
+            if key == "optical":                         # depth camera
                 ox, oy, oz = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-                xyz = np.stack([oz, -ox, -oy], axis=1)   # optical -> robot frame
-            blob = xyz.astype("<f4").tobytes()
-            SHARED.set_lidar(blob, xyz.shape[0])
+                xyz = np.stack([oz, -ox, -oy], axis=1)   # optical -> body frame
+            elif key in _SOURCE_ROT:                     # lidar: sensor -> body
+                xyz = xyz @ _SOURCE_ROT[key].T
+            SHARED.set_lidar_cloud(key, xyz.astype(np.float32))
         except Exception as e:  # noqa: BLE001
-            self.get_logger().warn(f"cloud convert failed: {e}")
+            self.get_logger().warn(f"cloud convert failed ({key}): {e}")
 
     def _tick(self):
         with SHARED.cmd_lock:

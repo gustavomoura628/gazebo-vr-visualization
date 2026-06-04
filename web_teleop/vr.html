@@ -81,15 +81,14 @@ function buildScene() {
   scene.add(dir);
 
   // 3D lidar cloud, rendered as lit instanced spheres at TRUE 1:1 metric scale,
-  // centred on the head. Coloured by distance (red near -> blue far). The cloud
-  // arrives rotated vs the VR head frame; correct with Ry(+90) (tuned for the
-  // lidar body frame; the depth-cam fallback would need an extra Rx(+90) roll).
+  // centred on the head. Coloured by distance (red near -> blue far). The bridge
+  // delivers points already in the robot BODY frame, so no per-source rotation
+  // here — onLidar just does the fixed body->VR remap.
   const sgeo = new THREE.SphereGeometry(1, 6, 4);   // low-poly; scaled per instance
   const smat = new THREE.MeshLambertMaterial();
   sphereMesh = new THREE.InstancedMesh(sgeo, smat, LIDAR_MAXPTS);
   sphereMesh.count = 0;
   sphereMesh.frustumCulled = false;
-  sphereMesh.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
   scene.add(sphereMesh);
 
   buildControllers();

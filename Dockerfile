@@ -119,6 +119,39 @@ RUN sed -i 's# h_samples="640"# h_samples="640" v_samples="16" v_min_angle="-0.1
  && sed -i 's#r_max="12.0"#r_max="40.0"#' \
     /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro
 
+# Second lidar: replicate the real robot's two-MID-360 setup. Top lidar (the
+# existing rplidar) mounted normally + tilted forward; bottom lidar mounted
+# upside-down (roll pi) + tilted forward, 8 cm below. The two forward-tilt angles
+# are xacro properties to measure on the real robot later. (TurtleBot4 has no
+# "mouth"/"neck", so positions are approximate; orientation/config is faithful.)
+RUN python3 - <<'PY'
+import pathlib
+f = pathlib.Path("/opt/ros/humble/share/turtlebot4_description/urdf/standard/turtlebot4.urdf.xacro")
+s = f.read_text()
+# tilt parameters (rad) — MUST MATCH TOP/BOTTOM_LIDAR_PITCH in teleop_bridge.py
+s = s.replace('value="${9.8715*cm2m}"/>',
+    'value="${9.8715*cm2m}"/>\n'
+    '  <xacro:property name="top_lidar_pitch"    value="0.30"/>\n'
+    '  <xacro:property name="bottom_lidar_pitch" value="0.30"/>', 1)
+old = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
+       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${rplidar_z_offset}"\n'
+       '            rpy="0 0 ${pi/2}"/>\n'
+       '  </xacro:rplidar>')
+new = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
+       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${rplidar_z_offset}"\n'
+       '            rpy="0 ${top_lidar_pitch} ${pi/2}"/>\n'
+       '  </xacro:rplidar>\n'
+       '  <xacro:rplidar name="lidar_bottom" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
+       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${rplidar_z_offset - 0.08}"\n'
+       '            rpy="${pi} ${bottom_lidar_pitch} ${pi/2}"/>\n'
+       '  </xacro:rplidar>')
+assert old in s, "rplidar instantiation block not found"
+s = s.replace(old, new, 1)
+assert s.count('xacro:rplidar name=') == 2, "expected exactly 2 lidars"
+f.write_text(s)
+print("two lidars injected")
+PY
+
 COPY web_teleop/ /web_teleop/
 
 # NOTE on speed: the TurtleBot4 is a Create3 base, hard-limited to ~0.46 m/s by
