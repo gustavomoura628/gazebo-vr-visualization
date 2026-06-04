@@ -110,12 +110,13 @@ RUN sed -i -E \
 RUN sed -i "s/' -r',/' -r --render-engine-server ogre2',/" \
     /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
 
-# Make the rplidar a 3D lidar: the shared ray_sensor macro already supports
-# vertical params, so just pass 16 rings over a +-15 deg vertical FOV. A gpu_lidar
-# with vertical>1 auto-publishes an organized 3D PointCloud2 on
-# .../rplidar/scan/points (bridged to /lidar/points in our launch). Stand-in for
-# the real MID-360.
-RUN sed -i 's# h_samples="640"# h_samples="640" v_samples="16" v_min_angle="-0.262" v_max_angle="0.262"#' \
+# Make the rplidar a 3D lidar approximating a Livox MID-360: 16 vertical rings
+# over the MID-360's asymmetric vertical FOV (-7 deg .. +52 deg = -0.122 .. +0.908
+# rad), and ~40 m range. gpu_lidar with vertical>1 auto-publishes a 3D PointCloud2
+# on .../rplidar/scan/points (bridged to /lidar/points in our launch).
+RUN sed -i 's# h_samples="640"# h_samples="640" v_samples="16" v_min_angle="-0.122" v_max_angle="0.908"#' \
+    /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro \
+ && sed -i 's#r_max="12.0"#r_max="40.0"#' \
     /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro
 
 COPY web_teleop/ /web_teleop/
