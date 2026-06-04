@@ -133,18 +133,20 @@ s = f.read_text()
 s = s.replace('value="${9.8715*cm2m}"/>',
     'value="${9.8715*cm2m}"/>\n'
     '  <xacro:property name="top_lidar_pitch"    value="0.30"/>\n'
-    '  <xacro:property name="bottom_lidar_pitch" value="0.30"/>', 1)
+    '  <xacro:property name="bottom_lidar_pitch" value="-0.30"/>', 1)
 old = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
        '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${rplidar_z_offset}"\n'
        '            rpy="0 0 ${pi/2}"/>\n'
        '  </xacro:rplidar>')
+# mounted at the FRONT EDGE of the sensor plate (plate r=0.137, centered ~x=-0.02,
+# so front edge ~+0.11), with a 0.06 m gap above/below so the bodies clear the plate.
 new = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
-       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${tower_sensor_plate_z_offset + 0.03}"\n'
-       '            rpy="0 ${top_lidar_pitch} ${pi/2}"/>\n'
+       '    <origin xyz="0.10 ${rplidar_y_offset} ${tower_sensor_plate_z_offset + 0.06}"\n'
+       '            rpy="0 ${top_lidar_pitch} 0"/>\n'
        '  </xacro:rplidar>\n'
        '  <xacro:rplidar name="lidar_bottom" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
-       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${tower_sensor_plate_z_offset - 0.03}"\n'
-       '            rpy="${pi} ${bottom_lidar_pitch} ${pi/2}"/>\n'
+       '    <origin xyz="0.10 ${rplidar_y_offset} ${tower_sensor_plate_z_offset - 0.06}"\n'
+       '            rpy="${pi} ${bottom_lidar_pitch} 0"/>\n'
        '  </xacro:rplidar>')
 assert old in s, "rplidar instantiation block not found"
 s = s.replace(old, new, 1)

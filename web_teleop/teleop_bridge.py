@@ -61,15 +61,47 @@ KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 
-# Two MID-360 stand-in lidars (top mounted normally, bottom upside-down). We only
-# need to bring the BOTTOM into the TOP's frame (undo its upside-down roll), then
-# both share one global orientation correction in the browser (vr.html). The mount
-# yaw/pitch are NOT undone here — they're part of the common frame the browser fixes.
-_RX_PI = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)  # roll 180
+# Two MID-360 stand-in lidars. Each cloud is rotated from its sensor frame into the
+# robot BODY frame (x fwd, y left, z up) by its mount rotation, so the browser just
+# does a fixed body->VR remap (no per-source rotation there).
+# These rotations MUST MATCH the mount rpy in the Dockerfile xacro patch:
+#   top    rpy = (0,      +PITCH, 0)  -> aims forward + DOWN
+#   bottom rpy = (pi,     -PITCH, 0)  -> upside-down, aims forward + UP
+# (yaw is 0 so "forward" is actually forward; verified by the forward-ray check.)
+LIDAR_PITCH = 0.30  # rad, forward tilt; MUST MATCH the xacro
+
+def _rpy_R(roll, pitch, yaw):
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).astype(np.float32)  # sensor-vector -> body-vector
+
 _SOURCE_ROT = {
-    "lidar_top":    np.eye(3, dtype=np.float32),  # as-is
-    "lidar_bottom": _RX_PI,                        # un-flip the upside-down mount
+    "lidar_top":    _rpy_R(0.0,     LIDAR_PITCH, 0.0),
+    "lidar_bottom": _rpy_R(np.pi,  -LIDAR_PITCH, 0.0),
 }
+
+# Mount POSITIONS in shell_link frame (MUST MATCH the xacro origins). Without these
+# each cloud would be drawn as if its sensor sat at the common origin, so the two
+# sensors (12 cm apart in height) would each report the floor at a different z -> two
+# ground planes. Translating by the mount offset puts both in one frame -> one floor.
+_PLATE_Z   = 0.25257   # tower_sensor_plate_z_offset
+_LIDAR_X   = 0.10      # forward to the plate's front edge
+_LIDAR_GAP = 0.06      # +above / -below the plate
+_SOURCE_T = {
+    "lidar_top":    np.array([_LIDAR_X, 0.0, _PLATE_Z + _LIDAR_GAP], np.float32),
+    "lidar_bottom": np.array([_LIDAR_X, 0.0, _PLATE_Z - _LIDAR_GAP], np.float32),
+}
+
+# Debug: cast a forward reference ray from each lidar (dense line of points along
+# the sensor +x axis). After transform it shows, in VR, exactly where each lidar
+# aims — top should point forward+down, bottom forward+up. Set MARKER_RAY=0 to off.
+MARKER_RAY = 1
+_MARKER_PTS = np.stack([np.linspace(0.2, 3.0, 24),
+                        np.zeros(24), np.zeros(24)], axis=1).astype(np.float32)
 
 # Sources = list of (ros_topic, key). Default: the two lidars. Single depth-camera
 # fallback via env:  CLOUD_TOPIC=/oakd/rgb/preview/depth/points CLOUD_FRAME=optical
@@ -251,11 +283,15 @@ class TeleopNode(Node):
             # cull self-hits: drop points closer than MIN_RANGE (the lidar sees the
             # robot's own body, which would otherwise sit right at the viewer).
             xyz = xyz[(xyz * xyz).sum(axis=1) > (MIN_RANGE * MIN_RANGE)]
+            # forward-ray debug marker (in the SENSOR frame, before transform) so it
+            # ends up showing exactly where this lidar aims.
+            if MARKER_RAY and key in _SOURCE_ROT:
+                xyz = np.concatenate([_MARKER_PTS, xyz], axis=0)
             if key == "optical":                         # depth camera
                 ox, oy, oz = xyz[:, 0], xyz[:, 1], xyz[:, 2]
                 xyz = np.stack([oz, -ox, -oy], axis=1)   # optical -> body frame
             elif key in _SOURCE_ROT:                     # lidar: sensor -> body
-                xyz = xyz @ _SOURCE_ROT[key].T
+                xyz = xyz @ _SOURCE_ROT[key].T + _SOURCE_T[key]
             SHARED.set_lidar_cloud(key, xyz.astype(np.float32))
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"cloud convert failed ({key}): {e}")
@@ -390,17 +426,37 @@ async def offer(request):
                 except Exception:  # noqa: BLE001
                     pass
         elif channel.label == "lidar":
-            # Server -> browser: push the latest scan blob every LIDAR_PERIOD_MS.
             async def lidar_loop():
-                while channel.readyState == "open":
-                    blob = SHARED.get_lidar()
-                    if blob:
-                        try:
-                            channel.send(blob)
-                            SHARED.add_lidar_bytes(len(blob))
-                        except Exception:  # noqa: BLE001
-                            pass  # skip this frame (e.g. transient/too-big); keep streaming
-                    await asyncio.sleep(LIDAR_PERIOD_MS / 1000.0)
+                sent = skipped = backpressured = 0
+                tick = 0
+                try:
+                    while channel.readyState == "open":
+                        tick += 1
+                        blob = SHARED.get_lidar()
+                        if blob:
+                            # backpressure: don't queue faster than the channel drains,
+                            # or the SCTP buffer bloats and the stream stalls for good.
+                            if getattr(channel, "bufferedAmount", 0) > 2 * len(blob):
+                                backpressured += 1
+                            else:
+                                try:
+                                    channel.send(blob)
+                                    SHARED.add_lidar_bytes(len(blob))
+                                    sent += 1
+                                except Exception as e:  # noqa: BLE001
+                                    skipped += 1
+                                    if skipped <= 5:
+                                        print(f"[lidar-tx] send failed: {e!r}", flush=True)
+                        # ~1 Hz heartbeat so we can SEE if/why the stream stalls
+                        if tick % max(1, int(1000 / LIDAR_PERIOD_MS)) == 0:
+                            print(f"[lidar-tx] state={channel.readyState} sent={sent} "
+                                  f"skipped={skipped} backpressured={backpressured} "
+                                  f"buffered={getattr(channel, 'bufferedAmount', '?')}", flush=True)
+                            sent = skipped = backpressured = 0
+                        await asyncio.sleep(LIDAR_PERIOD_MS / 1000.0)
+                except Exception as e:  # noqa: BLE001 — loop dying == permanent freeze
+                    print(f"[lidar-tx] loop CRASHED (permanent freeze): {e!r}", flush=True)
+                print(f"[lidar-tx] loop exited; channel state={channel.readyState}", flush=True)
             asyncio.ensure_future(lidar_loop())
 
     @pc.on("connectionstatechange")
