@@ -98,8 +98,9 @@ _SOURCE_T = {
 
 # Debug: cast a forward reference ray from each lidar (dense line of points along
 # the sensor +x axis). After transform it shows, in VR, exactly where each lidar
-# aims — top should point forward+down, bottom forward+up. Set MARKER_RAY=0 to off.
-MARKER_RAY = 1
+# aims — top should point forward+down, bottom forward+up. Retired now that
+# orientation is verified; set MARKER_RAY=1 to bring it back for re-checks.
+MARKER_RAY = 0
 _MARKER_PTS = np.stack([np.linspace(0.2, 3.0, 24),
                         np.zeros(24), np.zeros(24)], axis=1).astype(np.float32)
 
@@ -113,9 +114,26 @@ LIDAR_KEYS = [k for _, k in LIDAR_SOURCES]   # order: [top, bottom] for the 2-li
 
 LIDAR_PERIOD_MS = 100   # 10 Hz (the future throttle / prediction knob)
 CLOUD_MAX_PTS = 1500    # subsample target PER source (pre-cull)
-MIN_RANGE = 0.15        # cull only point-blank noise (m). NOT a self-hit filter:
-                        # self-returns are left visible so the top/bottom diagnostic
-                        # modes can show them (the mount is bad because TB4 != dog).
+
+# Self-hit cull: drop returns that land inside the robot's OWN body. The Create3
+# base (r~0.17) is the widest part, and the standoffs / front OAK-D camera / sensor
+# plate (r=0.137) all fit inside that radius, so ONE bounding cylinder about the
+# body z-axis (shell_link frame), floor -> plate-top, covers the whole robot. Simple
+# and robust; the only cost is a thin dead zone right against the body (which can't
+# be seen into anyway). Replaces the old point-blank MIN_RANGE filter, so a close
+# wall stays visible but the robot itself doesn't. (r_max^2, z_lo, z_hi).
+_SELF_CYLS = (
+    (0.18 ** 2, -0.10, 0.27),
+)
+
+def _cull_self(xyz):
+    """Keep only points OUTSIDE the robot body (xyz already in shell_link frame)."""
+    r2 = xyz[:, 0] ** 2 + xyz[:, 1] ** 2
+    z = xyz[:, 2]
+    inside = np.zeros(len(xyz), dtype=bool)
+    for r2max, zlo, zhi in _SELF_CYLS:
+        inside |= (r2 < r2max) & (z >= zlo) & (z <= zhi)
+    return xyz[~inside]
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -280,9 +298,6 @@ class TeleopNode(Node):
             raw = raw[::sr]                              # (blue-noise replaces this in Step 2)
             xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)
             xyz = xyz[np.isfinite(xyz).all(axis=1)]
-            # cull self-hits: drop points closer than MIN_RANGE (the lidar sees the
-            # robot's own body, which would otherwise sit right at the viewer).
-            xyz = xyz[(xyz * xyz).sum(axis=1) > (MIN_RANGE * MIN_RANGE)]
             # forward-ray debug marker (in the SENSOR frame, before transform) so it
             # ends up showing exactly where this lidar aims.
             if MARKER_RAY and key in _SOURCE_ROT:
@@ -292,6 +307,8 @@ class TeleopNode(Node):
                 xyz = np.stack([oz, -ox, -oy], axis=1)   # optical -> body frame
             elif key in _SOURCE_ROT:                     # lidar: sensor -> body
                 xyz = xyz @ _SOURCE_ROT[key].T + _SOURCE_T[key]
+            # now in shell_link frame: cull returns that hit the robot's own body.
+            xyz = _cull_self(xyz)
             SHARED.set_lidar_cloud(key, xyz.astype(np.float32))
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"cloud convert failed ({key}): {e}")

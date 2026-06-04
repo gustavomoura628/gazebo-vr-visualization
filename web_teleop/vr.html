@@ -62,16 +62,17 @@ const _m4 = new THREE.Matrix4(), _posV = new THREE.Vector3();
 const _scaleV = new THREE.Vector3(1, 1, 1);   // size is baked into the geometry
 const _quatI = new THREE.Quaternion();
 
-// Viewpoint: the head sits at the robot CENTRE (body x=0,y=0), EYE_UP metres up.
-// Reference space is 'local', so the head origin == body origin; subtracting EYE_UP
-// from the up-axis in the body->VR remap raises the eye to here (15 cm above the
-// sensor plate). Everything (cloud + robot model) uses the same remap so they align.
+// Viewpoint: where the head sits in the robot BODY frame. Reference space is 'local',
+// so the head origin maps to this eye point via the body->VR remap; everything (cloud
+// + robot model) uses the same remap so they stay aligned. The eye is set behind and
+// above the robot centre so you see the robot and its near surroundings.
 const PLATE_Z = 0.25257;        // tower_sensor_plate_z_offset (shell_link frame)
-const EYE_UP  = PLATE_Z + 0.15; // 15 cm above the top plate
+const EYE_X = -0.40;            // 40 cm behind robot centre (body -x is back)
+const EYE_Z = PLATE_Z + 0.15 + 0.10;  // 15 cm above the plate, raised another 10 cm
 const LIDAR_PITCH = 0.30;       // rad, forward mount tilt (MUST MATCH the xacro/bridge)
-let robotModel = null;          // to-scale simple-shape robot (B/Y toggles it)
-// body frame (x fwd, y left, z up) -> VR (x right, y up, z back), eye at EYE_UP.
-function bodyToVR(bx, by, bz, out) { return (out || new THREE.Vector3()).set(-by, bz - EYE_UP, -bx); }
+let robotModel = null;          // to-scale simple-shape robot (B button toggles it)
+// body frame (x fwd, y left, z up) -> VR (x right, y up, z back), relative to the eye.
+function bodyToVR(bx, by, bz, out) { return (out || new THREE.Vector3()).set(-by, bz - EYE_Z, -bx + EYE_X); }
 
 function buildScene() {
   scene = new THREE.Scene();
@@ -153,10 +154,11 @@ function buildScene() {
 }
 
 // To-scale approximation of the TurtleBot4 from simple primitives, dimensions taken
-// straight from the URDF (shell_link frame). It's a spatial anchor for the cloud, not
-// a faithful mesh, so it's drawn translucent (cloud shows through). All parts are
-// vertical cylinders (axis = body z = VR up), placed via the same bodyToVR remap as
-// the cloud, so the model and the points share one frame. B/Y toggles it.
+// straight from the URDF (shell_link frame): Create3 base, sensor plate, 4 tower
+// standoffs, the OAK-D-Pro front camera, and the two MID-360 pucks. A spatial anchor
+// for the cloud, not a faithful mesh, so it's drawn translucent (cloud shows
+// through). Placed via the same bodyToVR remap as the cloud so they share one frame.
+// B button toggles it.
 function buildRobot() {
   robotModel = new THREE.Group();
   const bodyMat  = new THREE.MeshLambertMaterial({ color: 0x9aa0a6, transparent: true, opacity: 0.40, depthWrite: false });
@@ -171,6 +173,12 @@ function buildRobot() {
   for (const [sx, sy] of [[0.03063, 0.11431], [0.03063, -0.11431],
                           [-0.07607, 0.09066], [-0.07607, -0.09066]])
     addCyl(0.006, 0.21, sx, sy, 0.147, bodyMat);           // 4 tower standoffs
+  // OAK-D-Pro front camera (the "Kinect bar"): body box 0.0225(x) x 0.097(y) x
+  // 0.03(z) at the bracket+oakd mount ~ (-0.060, 0, 0.149). body extents -> VR (y,z,x).
+  const oak = new THREE.Mesh(new THREE.BoxGeometry(0.097, 0.03, 0.0225),
+    new THREE.MeshLambertMaterial({ color: 0x2a2d33, transparent: true, opacity: 0.6, depthWrite: false }));
+  bodyToVR(-0.060, 0, 0.149, oak.position);
+  robotModel.add(oak);
   // MID-360 pucks, tilted with their real mount rpy (yaw=0). The puck axis = the
   // sensor's z; for mount R=Rz·Ry·Rx, sensor-z in body = R·[0,0,1] = [cr·sp,-sr,cr·cp].
   const _yAxis = new THREE.Vector3(0, 1, 0), _ax = new THREE.Vector3();
@@ -242,7 +250,7 @@ function renderCloud() {
   const count = Math.min(end - start, LIDAR_MAXPTS);
   for (let j = 0; j < count; j++) {
     const i = start + j;
-    bodyToVR(xyz[i*3], xyz[i*3+1], xyz[i*3+2], _posV);  // robot -> VR, eye at EYE_UP
+    bodyToVR(xyz[i*3], xyz[i*3+1], xyz[i*3+2], _posV);  // robot -> VR, relative to the eye
     _m4.compose(_posV, _quatI, _scaleV);
     sphereMesh.setMatrixAt(j, _m4);
   }
