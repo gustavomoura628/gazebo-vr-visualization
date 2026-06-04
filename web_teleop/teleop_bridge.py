@@ -61,32 +61,14 @@ KEY_PATH = "/tmp/teleop_key.pem"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 
-# Two MID-360 stand-in lidars (matching the real robot: a top one mounted normally
-# and a bottom one mounted upside-down, both tilted forward). Each cloud is
-# transformed from its sensor frame to the common robot BODY frame (x fwd, y left,
-# z up) before merging, so the browser just does a fixed body->VR remap (no
-# per-source rotation there).
-# These tilts MUST MATCH the xacro mount (top_lidar_pitch / bottom_lidar_pitch).
-TOP_LIDAR_PITCH = 0.30      # rad, forward tilt
-BOTTOM_LIDAR_PITCH = 0.30   # rad, forward tilt
-
-
-def _rpy_R(roll, pitch, yaw):
-    # Fixed-axis RPY -> R = Rz(yaw) @ Ry(pitch) @ Rx(roll). Maps a vector from the
-    # sensor frame into the robot body frame (same convention as URDF <origin rpy>).
-    cr, sr = np.cos(roll), np.sin(roll)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(yaw), np.sin(yaw)
-    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-    return (Rz @ Ry @ Rx).astype(np.float32)
-
-
-# sensor-frame -> body-frame rotation per source key.
+# Two MID-360 stand-in lidars (top mounted normally, bottom upside-down). We only
+# need to bring the BOTTOM into the TOP's frame (undo its upside-down roll), then
+# both share one global orientation correction in the browser (vr.html). The mount
+# yaw/pitch are NOT undone here — they're part of the common frame the browser fixes.
+_RX_PI = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)  # roll 180
 _SOURCE_ROT = {
-    "lidar_top":    _rpy_R(0.0,     TOP_LIDAR_PITCH,    np.pi / 2),
-    "lidar_bottom": _rpy_R(np.pi,   BOTTOM_LIDAR_PITCH, np.pi / 2),
+    "lidar_top":    np.eye(3, dtype=np.float32),  # as-is
+    "lidar_bottom": _RX_PI,                        # un-flip the upside-down mount
 }
 
 # Sources = list of (ros_topic, key). Default: the two lidars. Single depth-camera
@@ -98,8 +80,7 @@ else:
 LIDAR_KEYS = [k for _, k in LIDAR_SOURCES]   # order: [top, bottom] for the 2-lidar case
 
 LIDAR_PERIOD_MS = 100   # 10 Hz (the future throttle / prediction knob)
-CLOUD_MAX_PTS = 850     # subsample target PER source (pre-cull); merged stays
-                        # ~16 KB/msg — small enough for the unreliable datachannel.
+CLOUD_MAX_PTS = 1500    # subsample target PER source (pre-cull)
 MIN_RANGE = 0.15        # cull only point-blank noise (m). NOT a self-hit filter:
                         # self-returns are left visible so the top/bottom diagnostic
                         # modes can show them (the mount is bad because TB4 != dog).
