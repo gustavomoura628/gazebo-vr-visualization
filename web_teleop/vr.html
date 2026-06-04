@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X cycles camera / both / top / bottom lidar.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X cycles camera / both / top / bottom lidar. B/Y toggles the robot model.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -48,12 +48,23 @@ let hudCanvas = null, hudCtx = null, hudTex = null;
 let videoPanel = null;
 // A/X cycles: 0 camera, 1 both lidars, 2 top lidar only, 3 bottom lidar only
 const MODE_NAMES = ['camera', 'both', 'top', 'bottom'];
-let mode = 0, prevToggleBtn = false;
+let mode = 0, prevModeBtn = false, prevRobotBtn = false;
 const SPHERE_R = 0.03;          // sphere radius (m)
 let sphereMesh = null;
 const _m4 = new THREE.Matrix4(), _posV = new THREE.Vector3();
 const _scaleV = new THREE.Vector3(SPHERE_R, SPHERE_R, SPHERE_R);
 const _quatI = new THREE.Quaternion(), _col = new THREE.Color();
+
+// Viewpoint: the head sits at the robot CENTRE (body x=0,y=0), EYE_UP metres up.
+// Reference space is 'local', so the head origin == body origin; subtracting EYE_UP
+// from the up-axis in the body->VR remap raises the eye to here (15 cm above the
+// sensor plate). Everything (cloud + robot model) uses the same remap so they align.
+const PLATE_Z = 0.25257;        // tower_sensor_plate_z_offset (shell_link frame)
+const EYE_UP  = PLATE_Z + 0.15; // 15 cm above the top plate
+const LIDAR_PITCH = 0.30;       // rad, forward mount tilt (MUST MATCH the xacro/bridge)
+let robotModel = null;          // to-scale simple-shape robot (B/Y toggles it)
+// body frame (x fwd, y left, z up) -> VR (x right, y up, z back), eye at EYE_UP.
+function bodyToVR(bx, by, bz, out) { return (out || new THREE.Vector3()).set(-by, bz - EYE_UP, -bx); }
 
 function buildScene() {
   scene = new THREE.Scene();
@@ -91,6 +102,7 @@ function buildScene() {
   sphereMesh.frustumCulled = false;
   scene.add(sphereMesh);
 
+  buildRobot();
   buildControllers();
   applyMode();
 
@@ -104,6 +116,41 @@ function buildScene() {
   hud.position.set(0, -0.78, -2.0);
   scene.add(hud);
   drawHud();
+}
+
+// To-scale approximation of the TurtleBot4 from simple primitives, dimensions taken
+// straight from the URDF (shell_link frame). It's a spatial anchor for the cloud, not
+// a faithful mesh, so it's drawn translucent (cloud shows through). All parts are
+// vertical cylinders (axis = body z = VR up), placed via the same bodyToVR remap as
+// the cloud, so the model and the points share one frame. B/Y toggles it.
+function buildRobot() {
+  robotModel = new THREE.Group();
+  const bodyMat  = new THREE.MeshLambertMaterial({ color: 0x9aa0a6, transparent: true, opacity: 0.40, depthWrite: false });
+  const lidarMat = new THREE.MeshLambertMaterial({ color: 0x18d2d2, transparent: true, opacity: 0.85, depthWrite: false });
+  const addCyl = (r, h, bx, by, bz, mat) => {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 20), mat);  // default axis = Y = VR up
+    bodyToVR(bx, by, bz, m.position);
+    robotModel.add(m);
+  };
+  addCyl(0.1675, 0.0925, 0, 0, -0.046, bodyMat);          // Create3 base (top ~ body z=0)
+  addCyl(0.137,  0.003,  0, 0,  PLATE_Z, bodyMat);         // tower sensor plate (r=0.137)
+  for (const [sx, sy] of [[0.03063, 0.11431], [0.03063, -0.11431],
+                          [-0.07607, 0.09066], [-0.07607, -0.09066]])
+    addCyl(0.006, 0.21, sx, sy, 0.147, bodyMat);           // 4 tower standoffs
+  // MID-360 pucks, tilted with their real mount rpy (yaw=0). The puck axis = the
+  // sensor's z; for mount R=Rz·Ry·Rx, sensor-z in body = R·[0,0,1] = [cr·sp,-sr,cr·cp].
+  const _yAxis = new THREE.Vector3(0, 1, 0), _ax = new THREE.Vector3();
+  const addPuck = (bx, by, bz, roll, pitch) => {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.04, 20), lidarMat);
+    bodyToVR(bx, by, bz, m.position);
+    const cr = Math.cos(roll), sr = Math.sin(roll), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    _ax.set(-(-sr), cr * cp, -(cr * sp)).normalize();       // sensor-z body->VR direction
+    m.quaternion.setFromUnitVectors(_yAxis, _ax);
+    robotModel.add(m);
+  };
+  addPuck(0.10, 0, 0.313, 0,        LIDAR_PITCH);           // top: normal, pitched forward+down
+  addPuck(0.10, 0, 0.193, Math.PI, -LIDAR_PITCH);          // bottom: upside-down, forward+up
+  scene.add(robotModel);
 }
 
 // Tracked controllers: a laser ray + a tip dot per hand, so you can point at
@@ -155,7 +202,7 @@ function onLidar(buf) {
   for (let j = 0; j < count; j++) {
     const i = start + j;
     const rx = xyz[i*3], ry = xyz[i*3+1], rz = xyz[i*3+2];
-    _posV.set(-ry, rz, -rx);               // robot -> VR-local (right, up, back)
+    bodyToVR(rx, ry, rz, _posV);           // robot -> VR (right, up, back), eye at EYE_UP
     _m4.compose(_posV, _quatI, _scaleV);
     sphereMesh.setMatrixAt(j, _m4);
     const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
@@ -212,17 +259,20 @@ function applyMode() {
   if (sphereMesh) sphereMesh.visible = (mode >= 1);
 }
 
-// A/X button (buttons[4]/[5]) cycles camera -> distance -> EDL -> normals,
-// edge-detected so one press = one step.
+// A/X (button 4) cycles camera/both/top/bottom lidar; B/Y (button 5) toggles the
+// robot model. Both edge-detected so one press = one step.
 function checkToggle() {
   if (!xrSession) return;
-  let pressed = false;
+  let modeBtn = false, robotBtn = false;
   for (const src of xrSession.inputSources) {
     const b = src.gamepad && src.gamepad.buttons;
-    if (b && (b[4]?.pressed || b[5]?.pressed)) pressed = true;
+    if (!b) continue;
+    if (b[4]?.pressed) modeBtn = true;   // A / X
+    if (b[5]?.pressed) robotBtn = true;  // B / Y
   }
-  if (pressed && !prevToggleBtn) { mode = (mode + 1) % MODE_NAMES.length; applyMode(); }
-  prevToggleBtn = pressed;
+  if (modeBtn && !prevModeBtn) { mode = (mode + 1) % MODE_NAMES.length; applyMode(); }
+  if (robotBtn && !prevRobotBtn && robotModel) robotModel.visible = !robotModel.visible;
+  prevModeBtn = modeBtn; prevRobotBtn = robotBtn;
 }
 
 function onFrame(t) {
