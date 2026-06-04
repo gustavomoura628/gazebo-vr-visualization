@@ -95,14 +95,10 @@ function buildScene() {
   lidarCloud = new THREE.Points(lidarGeo, lmat);
   lidarCloud.position.set(0, 0, 0);        // 1:1 metric, no offset
   lidarCloud.scale.setScalar(1.0);
-  // The depth cloud arrives rotated vs the VR head frame. Correction derived
-  // from the observed misalignment ("yaw right 90 + roll left-ear-down 90"):
-  // apply Rx(-90) then Ry(+90). Tweak these two angles if it's still off.
-  {
-    const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0),  Math.PI / 2);
-    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0),  Math.PI / 2);
-    lidarCloud.quaternion.copy(qy.multiply(qx)); // qy*qx => apply qx first, then qy
-  }
+  // The cloud arrives rotated vs the VR head frame; correct it. Tuned for the
+  // 3D LIDAR source (body frame): just Ry(+90), no roll. NOTE: the depth-camera
+  // fallback uses the OPTICAL frame and needs an extra Rx(+90) roll.
+  lidarCloud.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
   scene.add(lidarCloud);
 
   // Lit-spheres mode: one small instanced sphere per point, shaded by the scene
