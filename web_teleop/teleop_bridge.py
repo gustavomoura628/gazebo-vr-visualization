@@ -97,7 +97,10 @@ else:
     LIDAR_SOURCES = [("/lidar/points", "lidar_top"), ("/lidar/points2", "lidar_bottom")]
 
 LIDAR_PERIOD_MS = 100   # 10 Hz (the future throttle / prediction knob)
-CLOUD_MAX_PTS = 1500    # subsample target PER source, to keep bandwidth sane
+CLOUD_MAX_PTS = 1200    # subsample target PER source (pre-cull). Merged + culled
+                        # stays ~1.2k pts (~14 KB/msg) — small enough for the
+                        # unreliable datachannel (large messages drop on the Quest).
+MIN_RANGE = 0.5         # cull points closer than this (m) -> removes robot self-hits
 
 API_MOVE = 1008
 API_STOPMOVE = 1003
@@ -258,6 +261,9 @@ class TeleopNode(Node):
             raw = raw[::sr]                              # (blue-noise replaces this in Step 2)
             xyz = raw[:, 0:12].copy().view(np.float32).reshape(-1, 3)
             xyz = xyz[np.isfinite(xyz).all(axis=1)]
+            # cull self-hits: drop points closer than MIN_RANGE (the lidar sees the
+            # robot's own body, which would otherwise sit right at the viewer).
+            xyz = xyz[(xyz * xyz).sum(axis=1) > (MIN_RANGE * MIN_RANGE)]
             if key == "optical":                         # depth camera
                 ox, oy, oz = xyz[:, 0], xyz[:, 1], xyz[:, 2]
                 xyz = np.stack([oz, -ox, -oy], axis=1)   # optical -> body frame
@@ -406,7 +412,7 @@ async def offer(request):
                             channel.send(blob)
                             SHARED.add_lidar_bytes(len(blob))
                         except Exception:  # noqa: BLE001
-                            break
+                            pass  # skip this frame (e.g. transient/too-big); keep streaming
                     await asyncio.sleep(LIDAR_PERIOD_MS / 1000.0)
             asyncio.ensure_future(lidar_loop())
 
