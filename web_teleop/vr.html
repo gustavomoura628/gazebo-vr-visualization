@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X cycles camera / distance / EDL / normals / spheres.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A/X toggles camera / 3D lidar.
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -40,17 +40,15 @@ const msg = document.getElementById('msg');
 
 let renderer, scene, camera, tex, channel = null, xrSession = null;
 
-// --- lidar ---
-const LIDAR_MAXPTS = 4000;     // hard cap on rendered points
-const LIDAR_DMAX = 6.0;        // distance (m) mapped to the "far"/blue end of the gradient
-let lidarGeo = null, lidarPos = null, lidarCol = null;
+// --- lidar (rendered as lit spheres, coloured by distance) ---
+const LIDAR_MAXPTS = 8000;     // hard cap on rendered points (two lidars combined)
+const LIDAR_DMAX = 6.0;        // distance (m) -> far/blue end of the colour gradient
 let lidarBytes = 0, lidarBytesRate = 0, lidarPts = 0;   // bandwidth tracking
 let hudCanvas = null, hudCtx = null, hudTex = null;
-let videoPanel = null, lidarCloud = null;               // toggled by controller
-// A/X cycles: 0 camera, 1 distance, 2 EDL, 3 normals (headlight), 4 lit spheres
-const MODE_NAMES = ['camera', 'distance', 'EDL', 'normals', 'spheres'];
+let videoPanel = null;
+// A/X cycles: 0 = camera (video), 1 = 3D lidar (lit spheres)
+const MODE_NAMES = ['camera', 'spheres'];
 let mode = 0, prevToggleBtn = false;
-// Lit-spheres mode
 const SPHERE_R = 0.03;          // sphere radius (m)
 let sphereMesh = null;
 const _m4 = new THREE.Matrix4(), _posV = new THREE.Vector3();
@@ -82,33 +80,16 @@ function buildScene() {
   dir.position.set(0.4, 0.8, 0.6);
   scene.add(dir);
 
-  // 3D point cloud, rendered at TRUE 1:1 metric scale, centered on the user's
-  // head (= the robot camera origin). A point N metres ahead of the camera shows
-  // N metres ahead in VR. Per-vertex colour = distance gradient (red near→blue far).
-  lidarGeo = new THREE.BufferGeometry();
-  lidarPos = new Float32Array(LIDAR_MAXPTS * 3);
-  lidarCol = new Float32Array(LIDAR_MAXPTS * 3);
-  lidarGeo.setAttribute('position', new THREE.BufferAttribute(lidarPos, 3));
-  lidarGeo.setAttribute('color', new THREE.BufferAttribute(lidarCol, 3));
-  lidarGeo.setDrawRange(0, 0);
-  const lmat = new THREE.PointsMaterial({ size: 0.035, vertexColors: true, sizeAttenuation: true });
-  lidarCloud = new THREE.Points(lidarGeo, lmat);
-  lidarCloud.position.set(0, 0, 0);        // 1:1 metric, no offset
-  lidarCloud.scale.setScalar(1.0);
-  // The cloud arrives rotated vs the VR head frame; correct it. Tuned for the
-  // 3D LIDAR source (body frame): just Ry(+90), no roll. NOTE: the depth-camera
-  // fallback uses the OPTICAL frame and needs an extra Rx(+90) roll.
-  lidarCloud.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
-  scene.add(lidarCloud);
-
-  // Lit-spheres mode: one small instanced sphere per point, shaded by the scene
-  // lights (a real 3D-rendered look). Shares the cloud's orientation correction.
+  // 3D lidar cloud, rendered as lit instanced spheres at TRUE 1:1 metric scale,
+  // centred on the head. Coloured by distance (red near -> blue far). The cloud
+  // arrives rotated vs the VR head frame; correct with Ry(+90) (tuned for the
+  // lidar body frame; the depth-cam fallback would need an extra Rx(+90) roll).
   const sgeo = new THREE.SphereGeometry(1, 6, 4);   // low-poly; scaled per instance
   const smat = new THREE.MeshLambertMaterial();
   sphereMesh = new THREE.InstancedMesh(sgeo, smat, LIDAR_MAXPTS);
   sphereMesh.count = 0;
   sphereMesh.frustumCulled = false;
-  sphereMesh.quaternion.copy(lidarCloud.quaternion);
+  sphereMesh.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
   scene.add(sphereMesh);
 
   buildControllers();
@@ -158,61 +139,27 @@ function drawHud() {
   hudTex.needsUpdate = true;
 }
 
-// Blob = [N float32 XYZ robot frame][N uint8 EDL shade][N int8 x3 normal].
-// We remap robot->VR (x right, y up, z back) and colour per the current mode:
-//   distance -> red(near)/green(mid)/blue(far)
-//   EDL      -> grayscale edge shading
-//   normals  -> grayscale Lambertian (surface curvature)
+// Blob = [N float32 XYZ robot frame]. Remap robot->VR (x right, y up, z back)
+// and render lit instanced spheres coloured by distance (red near -> blue far).
 function onLidar(buf) {
   lidarBytes += buf.byteLength;
-  const N = Math.floor(buf.byteLength / 16);   // 12 xyz + 1 shade + 3 normal
-  if (N <= 0) return;
+  const N = Math.floor(buf.byteLength / 12);   // 3 float32 per point
+  if (N <= 0 || !sphereMesh) return;
   const xyz = new Float32Array(buf, 0, N * 3);
-  const shade = new Uint8Array(buf, N * 12, N);
-  const nrm = new Int8Array(buf, N * 13, N * 3);
   const n = Math.min(N, LIDAR_MAXPTS);
-  const spheres = (mode === 4);
   for (let i = 0; i < n; i++) {
     const rx = xyz[i*3], ry = xyz[i*3+1], rz = xyz[i*3+2];
-    const vx = -ry, vy = rz, vz = -rx;     // robot -> VR-local (right, up, back)
-    lidarPos[i*3] = vx; lidarPos[i*3 + 1] = vy; lidarPos[i*3 + 2] = vz;
-    let r, g, b;
-    if (mode === 2) {                      // EDL: grayscale edge shade
-      const s = shade[i] / 255; r = g = b = s;
-    } else if (mode === 3) {               // normals, HEADLIGHT (view-stable)
-      const gx = -nrm[i*3+1] / 127, gy = nrm[i*3+2] / 127, gz = -nrm[i*3] / 127;
-      const nl = Math.hypot(gx, gy, gz);
-      if (nl < 0.3) { r = g = b = 0.12; }  // rejected normal (edge)
-      else {
-        // eye is at the origin, so view dir to this point = its position
-        const pl = Math.hypot(vx, vy, vz) || 1;
-        const facing = Math.abs((gx*vx + gy*vy + gz*vz) / (nl * pl));
-        r = g = b = 0.15 + 0.85 * facing;
-      }
-    } else {                               // distance gradient (modes 1 & spheres)
-      const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
-      const t = Math.min(d / LIDAR_DMAX, 1.0);
-      r = 1 - t; g = 1 - Math.abs(t - 0.5) * 2; b = t;
-    }
-    lidarCol[i*3] = r; lidarCol[i*3 + 1] = g; lidarCol[i*3 + 2] = b;
-    if (spheres) {
-      _posV.set(vx, vy, vz);
-      _m4.compose(_posV, _quatI, _scaleV);
-      sphereMesh.setMatrixAt(i, _m4);
-      sphereMesh.setColorAt(i, _col.setRGB(r, g, b));
-    }
+    _posV.set(-ry, rz, -rx);               // robot -> VR-local (right, up, back)
+    _m4.compose(_posV, _quatI, _scaleV);
+    sphereMesh.setMatrixAt(i, _m4);
+    const d = Math.sqrt(rx*rx + ry*ry + rz*rz);
+    const t = Math.min(d / LIDAR_DMAX, 1.0);
+    sphereMesh.setColorAt(i, _col.setRGB(1 - t, 1 - Math.abs(t - 0.5) * 2, t));
   }
   lidarPts = n;
-  if (lidarGeo) {
-    lidarGeo.setDrawRange(0, n);
-    lidarGeo.attributes.position.needsUpdate = true;
-    lidarGeo.attributes.color.needsUpdate = true;
-  }
-  if (spheres && sphereMesh) {
-    sphereMesh.count = n;
-    sphereMesh.instanceMatrix.needsUpdate = true;
-    if (sphereMesh.instanceColor) sphereMesh.instanceColor.needsUpdate = true;
-  }
+  sphereMesh.count = n;
+  sphereMesh.instanceMatrix.needsUpdate = true;
+  if (sphereMesh.instanceColor) sphereMesh.instanceColor.needsUpdate = true;
 }
 
 // Bandwidth meter: once a second, snapshot bytes -> rate, refresh the HUD.
@@ -253,11 +200,10 @@ function tickControl(t) {
 }
 setInterval(() => { if (!xrSession) tickControl(performance.now()); }, 1000 / SEND_HZ);
 
-// mode 0 = video; 1-3 = point cloud; 4 = lit spheres (all at true 1:1 scale).
+// mode 0 = video panel; mode 1 = 3D lidar spheres.
 function applyMode() {
   if (videoPanel) videoPanel.visible = (mode === 0);
-  if (lidarCloud) lidarCloud.visible = (mode >= 1 && mode <= 3);
-  if (sphereMesh) sphereMesh.visible = (mode === 4);
+  if (sphereMesh) sphereMesh.visible = (mode === 1);
 }
 
 // A/X button (buttons[4]/[5]) cycles camera -> distance -> EDL -> normals,
