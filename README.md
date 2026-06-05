@@ -40,12 +40,45 @@ sits at the robot, slightly back and above the sensor plate.
 
 ## Requirements
 
-- **Docker** with the **NVIDIA Container Toolkit** (`--gpus all`). An NVIDIA GPU is
-  **required**: Gazebo renders the GPU lidars with OGRE2, which needs a real GL 3.3+
-  context. On the Intel iGPU EGL path it silently falls back to OGRE1 and every
-  `gpu_lidar` reads zero — so the sensors must render on NVIDIA.
-- ROS 2 Humble + Ignition Gazebo Fortress (provided inside the Docker image).
+- **An NVIDIA GPU** (required). Gazebo renders the GPU lidars + camera with OGRE2 on
+  the GPU via headless EGL; without a usable NVIDIA GL context it falls back to
+  software (llvmpipe) and the sim crawls / sensors read zero. A modern discrete card
+  is recommended — an old entry-level card (e.g. GTX 750 Ti) builds and runs but is
+  too weak for acceptable frame rates.
+- **Docker** + the **NVIDIA Container Toolkit** (for `--gpus all`).
+- ROS 2 Humble + Ignition Gazebo Fortress — provided *inside* the Docker image, you
+  don't install them on the host.
 - A **Meta Quest** (or any WebXR headset) on the **same Wi-Fi** as the host.
+
+### Setting up a fresh machine
+
+These are the host prerequisites (everything else is in the image). Validated on
+Ubuntu and Manjaro:
+
+```bash
+# 1. Docker + NVIDIA driver (use your distro's packages; verify the driver works):
+nvidia-smi                      # must list your GPU
+
+# 2. NVIDIA Container Toolkit (package name varies by distro):
+#    Debian/Ubuntu:  sudo apt install nvidia-container-toolkit
+#    Arch/Manjaro:   sudo pacman -S nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# 3. Verify the GPU is reachable from a container:
+docker run --rm --gpus all ubuntu nvidia-smi   # should print your GPU
+
+# 4. Clone + run:
+git clone https://github.com/gustavomoura628/gazebo-vr-visualization.git
+cd gazebo-vr-visualization
+./run_simulation.sh
+```
+
+**Sanity check that rendering is on the GPU** (not software): while the sim runs,
+`nvidia-smi` should list **`ign gazebo server`** using GPU memory. If you instead see
+`libEGL ... failed to create dri2 screen` / `llvmpipe` in the logs and the GPU is
+idle, EGL didn't reach the NVIDIA card (`run_simulation.sh` pins it via
+`__EGL_VENDOR_LIBRARY_FILENAMES`; ensure the toolkit step above succeeded).
 
 ---
 
