@@ -21,6 +21,12 @@ docker run -it --rm \
     --gpus all \
     --env="NVIDIA_DRIVER_CAPABILITIES=all" \
     --env="NVIDIA_VISIBLE_DEVICES=all" \
+    `# Pin EGL to the NVIDIA vendor ICD. Without this, glvnd EGL picks Mesa (dri2),` \
+    `# fails ("failed to create dri2 screen"), and OGRE2 falls back to software/iGPU.` \
+    `# Combined with --headless-rendering (baked in the image) this puts the gz` \
+    `# server's sensor rendering on the RTX. Verify with nvidia-smi ( "ign gazebo` \
+    `# server" should appear using GPU memory).` \
+    --env="__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json" \
     $DRI_DEVICE \
     --env="ROS_DOMAIN_ID=0" \
     --env="IGN_IP=127.0.0.1" \

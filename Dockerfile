@@ -107,7 +107,11 @@ RUN sed -i -E \
 # (all gpu_lidar sensors return 0). OGRE2 needs a real GL3.3+ context, which we
 # get by rendering on the NVIDIA GPU (run with --gpus all; see run_simulation.sh).
 # Patch the hardcoded ign_args in ignition.launch.py to add the engine flag.
-RUN sed -i "s/' -r',/' -r --render-engine-server ogre2',/" \
+# --headless-rendering forces the server to render sensors via EGL (offscreen) instead
+# of GLX-on-DISPLAY (Intel iGPU). With __EGL_VENDOR_LIBRARY_FILENAMES pinned to the
+# NVIDIA ICD (see run_simulation.sh) this puts sensor rendering on the RTX. The GUI
+# still renders separately on the X display.
+RUN sed -i "s/' -r',/' -r --render-engine-server ogre2 --headless-rendering',/" \
     /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
 
 # Make the rplidar a 3D lidar approximating a Livox MID-360: 16 vertical rings
@@ -117,7 +121,21 @@ RUN sed -i "s/' -r',/' -r --render-engine-server ogre2',/" \
 RUN sed -i 's# h_samples="640"# h_samples="640" v_samples="16" v_min_angle="-0.122" v_max_angle="0.908"#' \
     /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro \
  && sed -i 's#r_max="12.0"#r_max="40.0"#' \
+    /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro \
+ && sed -i 's#update_rate="62.0"#update_rate="15.0"#' \
     /opt/ros/humble/share/turtlebot4_description/urdf/sensors/rplidar.urdf.xacro
+
+# PERFORMANCE: the gz sim is bottlenecked by the sensor-render pipeline (per-sensor
+# OGRE2 cull/LOD + GPU readback, serial in the server loop), NOT physics/GPU/scene.
+# The Create3 carries cliff (x4) + IR-intensity (x7) + IR-opcode ray sensors all at
+# 62 Hz (~700 scene renders/s) that we don't use for VR teleop. Dropping them to 1 Hz
+# took camera 10->27 fps and RTF 0.36->0.89 on an RTX 3050 laptop.
+RUN sed -i 's#name="update_rate"         value="62"#name="update_rate"         value="1"#' \
+    /opt/ros/humble/share/irobot_create_description/urdf/sensors/cliff_sensor.urdf.xacro \
+ && sed -i 's#update_rate:=62.0#update_rate:=1.0#' \
+    /opt/ros/humble/share/irobot_create_description/urdf/sensors/ir_intensity.urdf.xacro \
+ && sed -i 's#update_rate:=62#update_rate:=1#' \
+    /opt/ros/humble/share/irobot_create_description/urdf/sensors/ir_opcode_receivers.urdf.xacro
 
 # Second lidar: replicate the real robot's two-MID-360 setup, mounted at the
 # tower TOP SENSOR PLATE (~25 cm up) so they see over the chassis instead of
