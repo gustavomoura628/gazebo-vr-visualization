@@ -263,8 +263,10 @@ class TeleopNode(Node):
             rgb = data.reshape(h, w, 3)
             if msg.encoding == "bgr8":
                 rgb = rgb[:, :, ::-1]
+            rgb = np.array(rgb, dtype=np.uint8)      # guaranteed-writable contiguous copy
+            _stamp_frame(rgb, int(time.time() * 1000))   # capture-time watermark (in place)
             with SHARED.frame_lock:
-                SHARED.rgb = np.ascontiguousarray(rgb)
+                SHARED.rgb = rgb
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"image convert failed: {e}")
 
@@ -359,6 +361,31 @@ class TeleopNode(Node):
 # ---------------------------------------------------------------------------
 # WebRTC video track: latest ROS frame, paced to VIDEO_FPS
 # ---------------------------------------------------------------------------
+# --- frame timestamp watermark (true glass-to-glass latency) ---
+# A row of high-contrast blocks at top-left encodes the server CAPTURE time (low 24
+# bits of unix ms). The browser decodes it at DISPLAY time and computes latency =
+# (now + clock_offset) - stamp. Stamped at capture, so a stale/duplicated frame shows
+# GROWING latency (exposes the fixed-cadence "fake fps"). Layout matched in rtc.js:
+# 2 reference blocks (white, black) then 24 data bits MSB-first, square side `blk`.
+STAMP_MARGIN = 4
+STAMP_NBITS = 24
+STAMP_NBLK = 2 + STAMP_NBITS
+
+def _stamp_frame(rgb, t_ms):
+    h, w = rgb.shape[:2]
+    blk = max(6, int(w * 0.03))
+    if STAMP_MARGIN + STAMP_NBLK * blk > w or STAMP_MARGIN + blk > h:
+        return rgb                                   # frame too small to stamp
+    val = int(t_ms) & ((1 << STAMP_NBITS) - 1)
+    cols = [255, 0] + [255 if (val >> (STAMP_NBITS - 1 - i)) & 1 else 0
+                       for i in range(STAMP_NBITS)]
+    y0, y1 = STAMP_MARGIN, STAMP_MARGIN + blk
+    for i, c in enumerate(cols):
+        x0 = STAMP_MARGIN + i * blk
+        rgb[y0:y1, x0:x0 + blk, :] = c
+    return rgb
+
+
 class CameraTrack(VideoStreamTrack):
     kind = "video"
 
@@ -412,6 +439,12 @@ async def static_file(request):
     return _static_response(request.path)
 
 
+async def time_http(request):
+    """Server clock in unix ms, for the browser's NTP-style offset estimation."""
+    return web.json_response({"t": time.time() * 1000.0},
+                             headers={"Cache-Control": "no-store"})
+
+
 async def cmd_http(request):
     """Fire-and-forget HTTP control fallback: /cmd?vx=&vy=&vyaw="""
     q = request.rel_url.query
@@ -431,6 +464,8 @@ async def offer(request):
     params = await request.json()
     pc = RTCPeerConnection()
     PCS.add(pc)
+    # per-connection state (so one client toggling the cloud doesn't affect others)
+    pc_state = {"cloud_on": True}
 
     @pc.on("datachannel")
     def on_datachannel(channel):
@@ -439,7 +474,10 @@ async def offer(request):
             def on_message(message):
                 try:
                     d = json.loads(message)
-                    SHARED.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("vyaw", 0))
+                    if "cloud" in d:                     # cloud on/off toggle
+                        pc_state["cloud_on"] = bool(d["cloud"])
+                    else:                                # drive command
+                        SHARED.set_cmd(d.get("vx", 0), d.get("vy", 0), d.get("vyaw", 0))
                 except Exception:  # noqa: BLE001
                     pass
         elif channel.label == "lidar":
@@ -449,7 +487,8 @@ async def offer(request):
                 try:
                     while channel.readyState == "open":
                         tick += 1
-                        blob = SHARED.get_lidar()
+                        # cloud off => send nothing, freeing the whole pipe for video
+                        blob = SHARED.get_lidar() if pc_state["cloud_on"] else None
                         if blob:
                             # backpressure: don't queue faster than the channel drains,
                             # or the SCTP buffer bloats and the stream stalls for good.
@@ -498,6 +537,7 @@ def make_app():
     app.router.add_post("/offer", offer)
     app.router.add_get("/cmd", cmd_http)
     app.router.add_get("/stop", stop_http)
+    app.router.add_get("/time", time_http)
     app.router.add_get("/{name}", static_file)
     return app
 

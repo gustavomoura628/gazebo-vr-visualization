@@ -30,6 +30,13 @@
   .hint { padding:6px 14px 12px; font-size:12px; color:#7d8fa0; text-align:center;
           background:var(--panel); }
   .hint b { color:#9fb0c0; }
+  .stats { position:absolute; top:8px; left:8px; padding:8px 10px; border-radius:8px;
+           background:rgba(11,15,20,0.78); color:#39ff14; white-space:pre;
+           font:600 13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+           pointer-events:none; font-variant-numeric:tabular-nums; }
+  #cloudBtn { font-size:13px; padding:4px 10px; border-radius:8px; cursor:pointer;
+              background:#1f2a35; border:1px solid #2c3a47; color:#e6edf3; }
+  #cloudBtn.on { background:var(--accent); color:#04201c; border-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -37,11 +44,13 @@
   <header>
     <h1>Go2W Sim Teleop</h1>
     <a href="/vr.html">Enter VR ▸</a>
+    <button id="cloudBtn" class="on">Cloud: ON</button>
     <div id="status">connecting…</div>
   </header>
 
   <div class="stage">
     <video id="video" autoplay muted playsinline></video>
+    <div id="stats" class="stats">connecting…</div>
   </div>
 
   <div class="pad">
@@ -110,14 +119,40 @@ setInterval(() => {
   statusEl.textContent = `${link} · vx ${vx.toFixed(2)} vyaw ${vyaw.toFixed(2)}`;
 }, 150);
 
+// --- video instrumentation overlay + cloud toggle ---
+const statsEl = document.getElementById('stats');
+let cloudOn = true, clockOffset = null, latencyMs = null, contentFps = 0;
+const fmtbps = k => k >= 1000 ? (k / 1000).toFixed(2) + ' Mbps' : Math.round(k) + ' kbps';
+function renderStats(s) {
+  const rtt = s.rttMs != null ? s.rttMs.toFixed(0) + 'ms' : '—';
+  const e2e = latencyMs != null ? Math.round(latencyMs) + 'ms' : '—';
+  statsEl.textContent =
+    `latency ${e2e}   fps ${contentFps.toFixed(1)} (enc ${s.fps})   ${s.w}x${s.h}\n` +
+    `video ${fmtbps(s.vkbps)}   total ${fmtbps(s.tkbps)}   cloud:${cloudOn ? 'ON' : 'OFF'}\n` +
+    `net RTT ${rtt}   jbuf ${s.jbMs.toFixed(0)}ms   loss ${s.loss}`;
+}
+const cloudBtn = document.getElementById('cloudBtn');
+cloudBtn.addEventListener('click', () => {
+  cloudOn = !cloudOn;
+  setCloud(() => channel, cloudOn);
+  cloudBtn.classList.toggle('on', cloudOn);
+  cloudBtn.textContent = 'Cloud: ' + (cloudOn ? 'ON' : 'OFF');
+});
+
 // Connect
 (async () => {
   try {
-    const { getChannel } = await connectWebRTC(document.getElementById('video'));
+    const video = document.getElementById('video');
+    const { pc, getChannel } = await connectWebRTC(video);
     channel = getChannel();
     statusEl.textContent = 'connected';
+    startStats(pc, renderStats);
+    clockOffset = await syncClock();                       // initial clock offset
+    setInterval(async () => { const o = await syncClock(); if (o != null) clockOffset = o; }, 15000);
+    startLatencyMeter(video, () => clockOffset, m => { latencyMs = m.latencyMs; contentFps = m.fps; });
   } catch (e) {
     statusEl.textContent = 'WebRTC failed: ' + e;
+    statsEl.textContent = 'WebRTC failed';
   }
 })();
 </script>

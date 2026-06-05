@@ -24,7 +24,7 @@
   <h1>Go2W Sim — VR Teleop</h1>
   <video id="video" autoplay muted playsinline></video>
   <button id="enter" disabled>checking VR…</button>
-  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A cycles lidar mode (camera/both/top/bottom). X cycles point shape (ico20/geo32/dod36/octa/cube). Y toggles flat/smooth shading. B toggles the robot model.
+  <p>In VR: <b>left stick</b> = forward/back, <b>right stick</b> = turn. Reverse is limited. A cycles lidar mode (camera/both/top/bottom). X cycles point shape (ico20/geo32/dod36/octa/cube). Y toggles flat/smooth shading. B toggles the robot model. Right stick-click toggles the cloud stream (off = full bandwidth for video).
      <br>No headset? Use the <a href="/">2D page</a>.</p>
   <div id="msg"></div>
 </div>
@@ -49,6 +49,9 @@ let videoPanel = null;
 // A cycles: 0 camera, 1 both lidars, 2 top lidar only, 3 bottom lidar only
 const MODE_NAMES = ['camera', 'both', 'top', 'bottom'];
 let mode = 0, prevModeBtn = false, prevRobotBtn = false, prevShapeBtn = false, prevFlatBtn = false;
+let cloudOn = true, prevCloudBtn = false;   // right stick-click toggles cloud stream
+let vstats = null;                          // latest WebRTC video stats (for the HUD)
+let clockOffset = null, latencyMs = null, contentFps = 0;   // latency + true fps via frame stamps
 let pmat = null;                // shared point material (Y toggles flat/smooth shading)
 let flatShade = true;
 const POINT_R = 0.03;           // point half-size (m); baked into each geometry
@@ -143,12 +146,12 @@ function buildScene() {
 
   // In-VR bandwidth HUD: a small canvas-textured plane under the video panel.
   hudCanvas = document.createElement('canvas');
-  hudCanvas.width = 512; hudCanvas.height = 96;
+  hudCanvas.width = 512; hudCanvas.height = 192;
   hudCtx = hudCanvas.getContext('2d');
   hudTex = new THREE.CanvasTexture(hudCanvas);
-  const hud = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.225),
+  const hud = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.45),
     new THREE.MeshBasicMaterial({ map: hudTex, transparent: true }));
-  hud.position.set(0, -0.78, -2.0);
+  hud.position.set(0, -0.7, -2.0);
   scene.add(hud);
   drawHud();
 }
@@ -217,13 +220,22 @@ function buildControllers() {
 
 function drawHud() {
   if (!hudCtx) return;
-  hudCtx.clearRect(0, 0, 512, 96);
+  hudCtx.clearRect(0, 0, 512, 192);
   hudCtx.fillStyle = 'rgba(11,15,20,0.85)';
-  hudCtx.fillRect(0, 0, 512, 96);
+  hudCtx.fillRect(0, 0, 512, 192);
   hudCtx.fillStyle = '#39ff14';
-  hudCtx.font = 'bold 34px system-ui, sans-serif';
-  hudCtx.fillText(`${MODE_NAMES[mode]} · ${SHAPE_NAMES[shapeIdx]} ${flatShade ? 'flat' : 'smooth'} · ${lidarPts} pts`, 16, 40);
-  hudCtx.fillText(`${(lidarBytesRate * 8 / 1000).toFixed(0)} kbit/s`, 16, 82);
+  hudCtx.font = 'bold 28px ui-monospace, Menlo, monospace';
+  const fb = k => k >= 1000 ? (k / 1000).toFixed(2) + 'M' : Math.round(k) + 'k';
+  hudCtx.fillText(`${MODE_NAMES[mode]} · ${SHAPE_NAMES[shapeIdx]} ${flatShade ? 'flat' : 'smooth'} · ${lidarPts}pts`, 14, 34);
+  const lat = latencyMs != null ? Math.round(latencyMs) + 'ms' : '—';
+  if (vstats) {
+    const rtt = vstats.rttMs != null ? vstats.rttMs.toFixed(0) + 'ms' : '—';
+    hudCtx.fillText(`latency ${lat}  fps ${contentFps.toFixed(1)}(enc${vstats.fps})  ${vstats.w}x${vstats.h}`, 14, 78);
+    hudCtx.fillText(`vid ${fb(vstats.vkbps)}  tot ${fb(vstats.tkbps)}  cloud:${cloudOn ? 'ON' : 'OFF'}`, 14, 122);
+    hudCtx.fillText(`net RTT ${rtt}  jb ${vstats.jbMs.toFixed(0)}ms  loss ${vstats.loss}`, 14, 166);
+  } else {
+    hudCtx.fillText(`latency ${lat}  cloud:${cloudOn ? 'ON' : 'OFF'}  · waiting…`, 14, 78);
+  }
   hudTex.needsUpdate = true;
 }
 
@@ -332,19 +344,22 @@ function setFlat(on) {
 // All edge-detected so one press = one step.
 function checkToggle() {
   if (!xrSession) return;
-  let shapeBtn = false, modeBtn = false, flatBtn = false, robotBtn = false;
+  let shapeBtn = false, modeBtn = false, flatBtn = false, robotBtn = false, cloudBtn = false;
   for (const src of xrSession.inputSources) {
     const b = src.gamepad && src.gamepad.buttons;
     if (!b) continue;
     const left = src.handedness === 'left';
     if (b[4]?.pressed) { if (left) shapeBtn = true; else modeBtn = true; }
     if (b[5]?.pressed) { if (left) flatBtn  = true; else robotBtn = true; }
+    if (b[3]?.pressed && !left) cloudBtn = true;   // right stick-click = cloud on/off
   }
   if (modeBtn  && !prevModeBtn)  { mode = (mode + 1) % MODE_NAMES.length; applyMode(); renderCloud(); }
   if (shapeBtn && !prevShapeBtn) setShape((shapeIdx + 1) % SHAPE_NAMES.length);
   if (flatBtn  && !prevFlatBtn)  setFlat(!flatShade);
   if (robotBtn && !prevRobotBtn && robotModel) robotModel.visible = !robotModel.visible;
-  prevModeBtn = modeBtn; prevShapeBtn = shapeBtn; prevFlatBtn = flatBtn; prevRobotBtn = robotBtn;
+  if (cloudBtn && !prevCloudBtn) { cloudOn = !cloudOn; setCloud(() => channel, cloudOn); drawHud(); }
+  prevModeBtn = modeBtn; prevShapeBtn = shapeBtn; prevFlatBtn = flatBtn;
+  prevRobotBtn = robotBtn; prevCloudBtn = cloudBtn;
 }
 
 function onFrame(t) {
@@ -375,8 +390,12 @@ async function enterVR() {
 async function init() {
   buildScene();
   try {
-    const { getChannel } = await connectWebRTC(videoEl, { onLidar });
+    const { pc, getChannel } = await connectWebRTC(videoEl, { onLidar });
     channel = getChannel();
+    startStats(pc, s => { vstats = s; drawHud(); });   // live video FPS/bitrate/RTT on the HUD
+    clockOffset = await syncClock();                   // clock offset for latency
+    setInterval(async () => { const o = await syncClock(); if (o != null) clockOffset = o; }, 15000);
+    startLatencyMeter(videoEl, () => clockOffset, m => { latencyMs = m.latencyMs; contentFps = m.fps; });
   } catch (e) { msg.textContent = 'WebRTC failed: ' + e; }
 
   if (!navigator.xr) { enterBtn.textContent = 'WebXR not available'; return; }
