@@ -143,35 +143,12 @@ RUN sed -i 's#name="update_rate"         value="62"#name="update_rate"         v
 # tilt); bottom lidar just below it (upside-down roll pi + forward tilt). The two
 # forward-tilt angles are xacro properties to measure on the real robot later.
 # (TurtleBot4 has no "mouth"/"neck", so positions are approximate.)
-RUN python3 - <<'PY'
-import pathlib
-f = pathlib.Path("/opt/ros/humble/share/turtlebot4_description/urdf/standard/turtlebot4.urdf.xacro")
-s = f.read_text()
-# tilt parameters (rad) — MUST MATCH TOP/BOTTOM_LIDAR_PITCH in teleop_bridge.py
-s = s.replace('value="${9.8715*cm2m}"/>',
-    'value="${9.8715*cm2m}"/>\n'
-    '  <xacro:property name="top_lidar_pitch"    value="0.30"/>\n'
-    '  <xacro:property name="bottom_lidar_pitch" value="-0.30"/>', 1)
-old = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
-       '    <origin xyz="${rplidar_x_offset} ${rplidar_y_offset} ${rplidar_z_offset}"\n'
-       '            rpy="0 0 ${pi/2}"/>\n'
-       '  </xacro:rplidar>')
-# mounted at the FRONT EDGE of the sensor plate (plate r=0.137, centered ~x=-0.02,
-# so front edge ~+0.11), with a 0.06 m gap above/below so the bodies clear the plate.
-new = ('  <xacro:rplidar name="rplidar" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
-       '    <origin xyz="0.10 ${rplidar_y_offset} ${tower_sensor_plate_z_offset + 0.06}"\n'
-       '            rpy="0 ${top_lidar_pitch} 0"/>\n'
-       '  </xacro:rplidar>\n'
-       '  <xacro:rplidar name="lidar_bottom" parent_link="shell_link" gazebo="$(arg gazebo)">\n'
-       '    <origin xyz="0.10 ${rplidar_y_offset} ${tower_sensor_plate_z_offset - 0.06}"\n'
-       '            rpy="${pi} ${bottom_lidar_pitch} 0"/>\n'
-       '  </xacro:rplidar>')
-assert old in s, "rplidar instantiation block not found"
-s = s.replace(old, new, 1)
-assert s.count('xacro:rplidar name=') == 2, "expected exactly 2 lidars"
-f.write_text(s)
-print("two lidars injected")
-PY
+# Copied script, NOT a heredoc: `RUN python3 - <<HEREDOC` only works under BuildKit.
+# On a non-BuildKit build the heredoc is dropped, python gets empty stdin, does
+# nothing, and the image ships with the STOCK single lidar (builds fine, wrong robot)
+# -> tilted cloud + a "missing" second lidar. A COPY'd script is build-reproducible.
+COPY inject_two_lidars.py /tmp/inject_two_lidars.py
+RUN python3 /tmp/inject_two_lidars.py
 
 COPY web_teleop/ /web_teleop/
 
