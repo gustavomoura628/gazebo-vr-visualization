@@ -123,6 +123,16 @@ RUN sed -i -E \
 RUN sed -i "s/' -r',/' -s -r --render-engine-server ogre2 --headless-rendering',/" \
     /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
 
+# Ensure the NVIDIA EGL vendor ICD exists. nvidia-container-toolkit injects the EGL
+# *library* (libEGL_nvidia.so.0) at runtime but does NOT always inject this tiny glvnd
+# config that points EGL at it. Seen on a GTX 1660 Ti: only 50_mesa.json present ->
+# EGL can't find NVIDIA -> OGRE2 "No Interface could be loaded" -> server aborts (134).
+# Create it ourselves so EGL->NVIDIA works regardless of toolkit version. (When the
+# toolkit DOES inject it, its runtime bind-mount harmlessly overlays this same file.)
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+ && echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
 # Make the rplidar a 3D lidar approximating a Livox MID-360: 16 vertical rings
 # over the MID-360's asymmetric vertical FOV (-7 deg .. +52 deg = -0.122 .. +0.908
 # rad), and ~40 m range. gpu_lidar with vertical>1 auto-publishes a 3D PointCloud2
