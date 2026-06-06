@@ -107,11 +107,20 @@ RUN sed -i -E \
 # (all gpu_lidar sensors return 0). OGRE2 needs a real GL3.3+ context, which we
 # get by rendering on the NVIDIA GPU (run with --gpus all; see run_simulation.sh).
 # Patch the hardcoded ign_args in ignition.launch.py to add the engine flag.
-# --headless-rendering forces the server to render sensors via EGL (offscreen) instead
-# of GLX-on-DISPLAY (Intel iGPU). With __EGL_VENDOR_LIBRARY_FILENAMES pinned to the
-# NVIDIA ICD (see run_simulation.sh) this puts sensor rendering on the RTX. The GUI
-# still renders separately on the X display.
-RUN sed -i "s/' -r',/' -r --render-engine-server ogre2 --headless-rendering',/" \
+# Flags added to the gz server:
+#  -s                       run SERVER ONLY -- no Gazebo GUI. The GUI needs a GLX/X11
+#                           window, which is the #1 portability failure across machines
+#                           (Wayland, missing/locked DISPLAY, NVIDIA-GLX vs X mismatch):
+#                           it throws "GLXWindow::create: Invalid parentWindowHandle
+#                           (wrong server or screen)" and crashes the whole sim. We view
+#                           via the WebRTC/VR bridge, not the Gazebo window, so drop it.
+#  --render-engine-server ogre2 --headless-rendering
+#                           render sensors with OGRE2 OFFSCREEN via EGL (no X window at
+#                           all). With __EGL_VENDOR_LIBRARY_FILENAMES pinned to the NVIDIA
+#                           ICD (run_simulation.sh) this lands on the NVIDIA GPU. OGRE1
+#                           fallback silently zeros every gpu_lidar, so OGRE2 is required.
+# Net: zero X11/GLX dependency -> runs the same on any NVIDIA+Docker host, headless or not.
+RUN sed -i "s/' -r',/' -s -r --render-engine-server ogre2 --headless-rendering',/" \
     /opt/ros/humble/share/turtlebot4_ignition_bringup/launch/ignition.launch.py
 
 # Make the rplidar a 3D lidar approximating a Livox MID-360: 16 vertical rings

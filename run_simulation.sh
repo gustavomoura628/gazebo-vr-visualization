@@ -3,38 +3,39 @@ set -e
 
 docker build -t go2w_people_search:latest .
 
-# Allow X11 connections from Docker
-xhost +local:docker 2>/dev/null || true
-
-# GPU access for Ignition rendering.
-# - NVIDIA (--gpus all): REQUIRED. The sim server renders sensors with OGRE2,
-#   which needs a real GL3.3+ context. The Intel iGPU EGL path can't provide one
-#   in-container (eglInitialize / "OpenGL 3.3 not supported"), so OGRE2 would
-#   fall back to OGRE1, which silently breaks GPU lidar (all gpu_lidar -> 0).
-#   The NVIDIA RTX (via nvidia-container-toolkit) gives OGRE2 its GL context.
-# - /dev/dri (Intel): kept for the Gazebo GUI's GLX rendering on the X display.
-DRI_DEVICE=""
-[ -d /dev/dri ] && DRI_DEVICE="--device=/dev/dri:/dev/dri"
+# The sim runs SERVER-ONLY (no Gazebo GUI -- see the `-s` flag baked in the Dockerfile)
+# and renders sensors OFFSCREEN via EGL on the NVIDIA GPU. So it needs NO X11/display at
+# all -- no DISPLAY, no /tmp/.X11-unix, no xhost. That's deliberate: the Gazebo GUI's
+# GLX/X11 window is the #1 thing that breaks across machines (Wayland, locked DISPLAY,
+# NVIDIA-GLX vs X mismatch -> "GLXWindow::create: wrong server or screen" crash). You
+# view the robot through the WebRTC/VR bridge (run_teleop_bridge.sh), not a Gazebo window.
+#
+# Requirements (see README): an NVIDIA GPU + driver + nvidia-container-toolkit.
+#   --gpus all                                : expose the GPU to the container
+#   __EGL_VENDOR_LIBRARY_FILENAMES=...nvidia  : pin EGL to the NVIDIA ICD, else glvnd
+#       picks Mesa -> "failed to create dri2 screen" -> software render / zeroed lidar.
 
 docker run -it --rm \
     --net=host \
     --gpus all \
     --env="NVIDIA_DRIVER_CAPABILITIES=all" \
     --env="NVIDIA_VISIBLE_DEVICES=all" \
-    `# Pin EGL to the NVIDIA vendor ICD. Without this, glvnd EGL picks Mesa (dri2),` \
-    `# fails ("failed to create dri2 screen"), and OGRE2 falls back to software/iGPU.` \
-    `# Combined with --headless-rendering (baked in the image) this puts the gz` \
-    `# server's sensor rendering on the RTX. Verify with nvidia-smi ( "ign gazebo` \
-    `# server" should appear using GPU memory).` \
     --env="__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json" \
-    $DRI_DEVICE \
     --env="ROS_DOMAIN_ID=0" \
     --env="IGN_IP=127.0.0.1" \
-    --env="DISPLAY" \
-    --env="XAUTHORITY=/tmp/.Xauthority" \
-    --volume="/tmp/.X11-unix:/tmp/.X11-unix:rw" \
-    --volume="${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.Xauthority:ro" \
     go2w_people_search:latest \
-    ros2 launch aog_simulation unitree_adapter_simulation.xml
-
-xhost -local:docker 2>/dev/null || true
+    bash -lc '
+      echo "================= PREFLIGHT (GPU / EGL / render) ================="
+      echo "DISPLAY=${DISPLAY:-<unset, headless>}"
+      echo "__EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-<unset>}"
+      echo "--- nvidia-smi (is the GPU reachable INSIDE the container?) ---"
+      nvidia-smi -L 2>&1 || echo "!! nvidia-smi FAILED -> --gpus all / nvidia-container-toolkit not working"
+      echo "--- EGL vendor ICDs (need 10_nvidia.json) ---"
+      ls -1 /usr/share/glvnd/egl_vendor.d/ 2>&1
+      echo "--- NVIDIA EGL lib present? (need libEGL_nvidia) ---"
+      ls /usr/lib/x86_64-linux-gnu/libEGL_nvidia.so* 2>&1 | head -1 || echo "!! libEGL_nvidia missing -> NVIDIA_DRIVER_CAPABILITIES must include graphics"
+      echo "================================================================="
+      echo "[run] launching sim (server-only, headless EGL). If you see"
+      echo "[run] GLXWindow / dri2 / OGRE1 errors below, rendering is NOT on the GPU."
+      exec ros2 launch aog_simulation unitree_adapter_simulation.xml
+    '
