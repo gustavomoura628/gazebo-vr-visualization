@@ -51,44 +51,58 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
 
-# --- MTU fix: shrink WebRTC video RTP packets to survive low-MTU paths --------
-# aiortc hardcodes PACKET_MAX=1300 for its VP8/H264 RTP packetizers. On the wire
-# that is 1300 payload + 12 RTP + 8 UDP + 40 IPv6 = ~1360 bytes. Any tunnel with
-# a reduced MTU (Tailscale/WireGuard = 1280, most VPNs ~1400) drops those packets:
-# the tiny STUN checks fit so ICE *connects*, but every full-size video packet is
-# silently dropped -> "connected, no image". (Proven: path MTU to the peer maxed
-# out at ~1280; ping -M do failed at 1240+ payload.) IPv6 makes it slightly worse
-# (40B header, no router fragmentation), but forcing IPv4 wouldn't help -- the
-# tunnel MTU is 1280 either way; the real lever is packet size. 1200 payload ->
-# 1200+12+8+40 = 1260 < 1280, safe over Tailscale and any normal VPN. This is a
-# GENERAL fix (helps every low-MTU path, not just one machine) and costs only a
-# few extra packets per frame on a normal LAN. Set before any track is created.
+# --- MTU fix: shrink every WebRTC payload to survive a reduced-MTU path -------
+# WebRTC/aiortc sizes packets for a 1500-byte LAN and does NO path-MTU discovery.
+# A Tailscale/WireGuard tunnel (or most VPNs, or IPv6's guaranteed minimum) is
+# ~1280, so full-size media packets are SILENTLY DROPPED while the tiny STUN/DTLS
+# handshake packets fit -- you get "ICE connected, but no image and no lidar".
+# PROVEN against a live 1280 Tailscale path: forcing the connection onto the
+# Tailscale candidates gives conn=connected but video_frames=0 and a stuck lidar
+# DataChannel buffer; over a normal LAN the SAME build works.
+#
+# Budget over IPv6 (the worst case; header is 40 B and routers never fragment):
+#   usable UDP packet = 1280 - 40 (IPv6) - 8 (UDP) = 1232 bytes.
+#   RTP video : payload + 12 (RTP) + ~16 (header exts) + ~16 (SRTP/GCM tag) <= 1232
+#               -> payload <= ~1188.
+#   SCTP data : payload + ~28 (SCTP common+DATA chunk) + ~29 (DTLS rec + GCM) <= 1232
+#               -> payload <= ~1175.
+# So 1200 (the previous guess) is actually ~12 B TOO BIG over IPv6 -- which is why
+# the prior "fix" still failed on the second machine. We cap at 1000 (worst-case wire
+# ~1092/1105 << 1280, ~180 B margin -- robust on a lossy link) and make it
+# overridable via env so any future nudge is a bridge RESTART, never a rebuild.
+# GENERAL: helps every low-MTU path; on a normal LAN it just sends a few % more
+# packets. Must run before any track / DataChannel is created.
+import os as _os
+_RTC_MTU = int(_os.environ.get("RTC_MTU", "1000"))
+
+# (1) RTP video packetizers (VP8 + H264). Module globals read at packetize time.
 import aiortc.codecs.vpx as _vpx
 import aiortc.codecs.h264 as _h264
-_RTP_PACKET_MAX = 1200
-_vpx.PACKET_MAX = _RTP_PACKET_MAX
-_h264.PACKET_MAX = _RTP_PACKET_MAX
+_vpx.PACKET_MAX = _RTC_MTU
+_h264.PACKET_MAX = _RTC_MTU
 
-# The OTHER MTU victim: the DTLS handshake. aiortc never calls set_ciphertext_mtu,
-# so OpenSSL fragments the ServerHello+Certificate flight to its own default (~1400 B).
-# Over a 1280 path that flight is dropped -> DTLS never completes -> no SRTP keys and
-# no SCTP, i.e. "ICE connected, no video, DataChannels: 0" (the exact dump symptom).
-# This would make the RTP fix above useless on its own, so pin it too. _do_handshake
-# runs right after self._ssl is created (with connect/accept state already set), so
-# capping the ciphertext MTU there makes every handshake datagram fit:
-# 1200 + 8 UDP + 40 IPv6 = 1248 < 1280. Degrades gracefully if the pyOpenSSL build
-# lacks the API. GENERAL: helps any low-MTU path, no-op on a normal LAN.
+# (2) SCTP DataChannel (lidar + control). aiortc's USERDATA_MAX_LENGTH defaults to
+# 1200 and was NEVER touched before -> every lidar message (16-39 KB = many chunks)
+# had oversized chunks dropped, reliable retransmits looped forever, the send buffer
+# stuck (buffered=108600 in the logs) -> no lidar at all. This is the missing half.
+import aiortc.rtcsctptransport as _sctp
+_sctp.USERDATA_MAX_LENGTH = _RTC_MTU
+
+# (3) DTLS handshake. aiortc never calls set_ciphertext_mtu, so OpenSSL may fragment
+# the Certificate flight to its own (larger) default. DTLS actually completes on the
+# 1280 path in practice, but pin it too for safety/robustness on tighter paths.
+# _do_handshake runs right after self._ssl exists (connect/accept state already set).
 import aiortc.rtcdtlstransport as _dtls
 _orig_do_handshake = _dtls.RTCDtlsTransport._do_handshake
 async def _do_handshake_capped_mtu(self):
     try:
         if self._ssl is not None and hasattr(self._ssl, "set_ciphertext_mtu"):
-            self._ssl.set_ciphertext_mtu(_RTP_PACKET_MAX)
-            print(f"[mtu] DTLS ciphertext MTU pinned to {_RTP_PACKET_MAX}", flush=True)
-    except Exception as _e:  # noqa: BLE001 — RTP fix still applies even if this fails
+            self._ssl.set_ciphertext_mtu(_RTC_MTU)
+    except Exception as _e:  # noqa: BLE001 — other caps still apply if this fails
         print(f"[mtu] could not pin DTLS MTU ({_e!r}); continuing", flush=True)
     return await _orig_do_handshake(self)
 _dtls.RTCDtlsTransport._do_handshake = _do_handshake_capped_mtu
+print(f"[mtu] caps applied: RTP/SCTP/DTLS payload <= {_RTC_MTU} (RTC_MTU env)", flush=True)
 # -----------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

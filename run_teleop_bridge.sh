@@ -36,7 +36,10 @@ echo "  Open in the Quest browser:  http://${IP:-<laptop-ip>}:${PORT}"
 echo "  (Ctrl-C stops the bridge, not the sim.)"
 echo
 
-docker exec -it "${CONTAINER}" bash -lc "
+# Optional: override the WebRTC payload MTU cap (default 1000, set in teleop_bridge.py).
+# e.g. RTC_MTU=1100 ./run_teleop_bridge.sh  -- only forwarded if you set it (an empty
+# value would crash int()). Lower it only if media still drops on a tighter tunnel.
+docker exec -it ${RTC_MTU:+-e RTC_MTU=${RTC_MTU}} "${CONTAINER}" bash -lc "
     source /opt/ros/humble/setup.bash
     source /ros2_ws/install/setup.bash
     # Unlock the Create3 base's full speed (lifts the ~0.3 m/s safe-speed throttle
