@@ -48,7 +48,8 @@ from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from unitree_api.msg import Request
 
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import (RTCConfiguration, RTCPeerConnection, RTCSessionDescription,
+                    VideoStreamTrack)
 from av import VideoFrame
 
 # --- MTU fix: shrink every WebRTC payload to survive a reduced-MTU path -------
@@ -564,9 +565,20 @@ async def _diag_loop(pc, peer):
         await asyncio.sleep(2.0)
 
 
+# No ICE servers: gather HOST candidates only, never STUN/TURN. aiortc otherwise
+# defaults to Google's STUN to gather server-reflexive candidates -- and on a network
+# that can't reach it (DNS or UDP blocked), gather_candidates() HANGS FOREVER, so
+# /offer never returns an answer and the browser shows no video (seen on the second machine;
+# manjaro reached STUN so it worked -> the asymmetry that masked this). We connect over
+# Tailscale/LAN, whose addresses ARE host candidates, so srflx buys us nothing here.
+# Host-only gathering is also instant (0.00s vs ~0.65s). The web client already uses
+# iceServers:[]; this makes the bridge match.
+_ICE_CONFIG = RTCConfiguration(iceServers=[])
+
+
 async def offer(request):
     params = await request.json()
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(configuration=_ICE_CONFIG)
     PCS.add(pc)
     peer = request.remote
     print(f"[rtc {peer}] offer received", flush=True)
