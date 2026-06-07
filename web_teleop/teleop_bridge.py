@@ -51,6 +51,46 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
 
+# --- MTU fix: shrink WebRTC video RTP packets to survive low-MTU paths --------
+# aiortc hardcodes PACKET_MAX=1300 for its VP8/H264 RTP packetizers. On the wire
+# that is 1300 payload + 12 RTP + 8 UDP + 40 IPv6 = ~1360 bytes. Any tunnel with
+# a reduced MTU (Tailscale/WireGuard = 1280, most VPNs ~1400) drops those packets:
+# the tiny STUN checks fit so ICE *connects*, but every full-size video packet is
+# silently dropped -> "connected, no image". (Proven: path MTU to the peer maxed
+# out at ~1280; ping -M do failed at 1240+ payload.) IPv6 makes it slightly worse
+# (40B header, no router fragmentation), but forcing IPv4 wouldn't help -- the
+# tunnel MTU is 1280 either way; the real lever is packet size. 1200 payload ->
+# 1200+12+8+40 = 1260 < 1280, safe over Tailscale and any normal VPN. This is a
+# GENERAL fix (helps every low-MTU path, not just one machine) and costs only a
+# few extra packets per frame on a normal LAN. Set before any track is created.
+import aiortc.codecs.vpx as _vpx
+import aiortc.codecs.h264 as _h264
+_RTP_PACKET_MAX = 1200
+_vpx.PACKET_MAX = _RTP_PACKET_MAX
+_h264.PACKET_MAX = _RTP_PACKET_MAX
+
+# The OTHER MTU victim: the DTLS handshake. aiortc never calls set_ciphertext_mtu,
+# so OpenSSL fragments the ServerHello+Certificate flight to its own default (~1400 B).
+# Over a 1280 path that flight is dropped -> DTLS never completes -> no SRTP keys and
+# no SCTP, i.e. "ICE connected, no video, DataChannels: 0" (the exact dump symptom).
+# This would make the RTP fix above useless on its own, so pin it too. _do_handshake
+# runs right after self._ssl is created (with connect/accept state already set), so
+# capping the ciphertext MTU there makes every handshake datagram fit:
+# 1200 + 8 UDP + 40 IPv6 = 1248 < 1280. Degrades gracefully if the pyOpenSSL build
+# lacks the API. GENERAL: helps any low-MTU path, no-op on a normal LAN.
+import aiortc.rtcdtlstransport as _dtls
+_orig_do_handshake = _dtls.RTCDtlsTransport._do_handshake
+async def _do_handshake_capped_mtu(self):
+    try:
+        if self._ssl is not None and hasattr(self._ssl, "set_ciphertext_mtu"):
+            self._ssl.set_ciphertext_mtu(_RTP_PACKET_MAX)
+            print(f"[mtu] DTLS ciphertext MTU pinned to {_RTP_PACKET_MAX}", flush=True)
+    except Exception as _e:  # noqa: BLE001 — RTP fix still applies even if this fails
+        print(f"[mtu] could not pin DTLS MTU ({_e!r}); continuing", flush=True)
+    return await _orig_do_handshake(self)
+_dtls.RTCDtlsTransport._do_handshake = _do_handshake_capped_mtu
+# -----------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -460,12 +500,68 @@ async def stop_http(request):
     return web.Response(text="stopped")
 
 
+async def _diag_loop(pc, peer):
+    """Per-peer WebRTC diagnostics. Makes the next connect attempt decisive:
+       - dtlsState: 'connected' => DTLS made it (MTU handshake fix worked / wasn't
+         needed). Stuck at 'connecting' => DTLS still blocked (handshake too big).
+       - transport bytesSent climbing but the browser's remote-inbound
+         packetsReceived ~0 / packetsLost high => media packets dropped (RTP too big
+         for path MTU).
+       - selected ICE pair shows whether we're on the IPv4 or IPv6 Tailscale path.
+    Reads aiortc getStats (transport + outbound-rtp + remote-inbound-rtp)."""
+    await asyncio.sleep(2.0)
+    # one-shot: log the selected ICE pair (which path actually won)
+    try:
+        ice = pc.sctp.transport.transport._connection  # aioice Connection
+        for comp, pair in getattr(ice, "_nominated", {}).items():
+            lc, rc = pair.local_candidate, pair.remote_candidate
+            print(f"[rtc {peer}] ICE pair comp{comp}: "
+                  f"{lc.host}:{lc.port} ({lc.type}) -> {rc.host}:{rc.port} ({rc.type})",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[rtc {peer}] (could not read ICE pair: {e!r})", flush=True)
+    while pc.connectionState not in ("closed", "failed"):
+        try:
+            report = await pc.getStats()
+            dtls = vid = rin = None
+            for s in report.values():
+                t = getattr(s, "type", "")
+                if t == "transport":
+                    dtls = s
+                elif t == "outbound-rtp" and getattr(s, "kind", "video") == "video":
+                    vid = s
+                elif t == "remote-inbound-rtp":
+                    rin = s
+            line = [f"[rtc {peer}] conn={pc.connectionState}"]
+            if dtls is not None:
+                line.append(f"dtls={getattr(dtls,'dtlsState','?')} "
+                            f"tx={getattr(dtls,'bytesSent','?')}B "
+                            f"rx={getattr(dtls,'bytesReceived','?')}B")
+            if vid is not None:
+                line.append(f"vid_sent={getattr(vid,'packetsSent','?')}pkt/"
+                            f"{getattr(vid,'bytesSent','?')}B")
+            if rin is not None:  # what the BROWSER reports back to us
+                line.append(f"browser_recv_lost={getattr(rin,'packetsLost','?')} "
+                            f"fracLost={getattr(rin,'fractionLost','?')} "
+                            f"rtt={getattr(rin,'roundTripTime','?')}")
+            print(" ".join(line), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rtc {peer}] stats err: {e!r}", flush=True)
+        await asyncio.sleep(2.0)
+
+
 async def offer(request):
     params = await request.json()
     pc = RTCPeerConnection()
     PCS.add(pc)
+    peer = request.remote
+    print(f"[rtc {peer}] offer received", flush=True)
     # per-connection state (so one client toggling the cloud doesn't affect others)
     pc_state = {"cloud_on": True}
+
+    @pc.on("iceconnectionstatechange")
+    async def _on_ice():
+        print(f"[rtc {peer}] ICE -> {pc.iceConnectionState}", flush=True)
 
     @pc.on("datachannel")
     def on_datachannel(channel):
@@ -517,6 +613,7 @@ async def offer(request):
 
     @pc.on("connectionstatechange")
     async def on_state():
+        print(f"[rtc {peer}] conn -> {pc.connectionState}", flush=True)
         if pc.connectionState in ("failed", "closed", "disconnected"):
             await pc.close()
             PCS.discard(pc)
@@ -527,6 +624,22 @@ async def offer(request):
         RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
+
+    # DTLS state logging (the video sender + sctp share dtls transports). Attached
+    # after setLocalDescription so the transports exist. Tells us exactly whether the
+    # handshake completes -> isolates "DTLS blocked" from "media dropped".
+    try:
+        transports = [getattr(s, "transport", None) for s in pc.getSenders()]
+        if pc.sctp is not None:
+            transports.append(getattr(pc.sctp, "transport", None))
+        for _t in {id(t): t for t in transports if t is not None}.values():
+            @_t.on("statechange")
+            def _on_dtls(tr=_t):
+                print(f"[rtc {peer}] DTLS -> {tr.state}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[rtc {peer}] (could not attach DTLS logging: {e!r})", flush=True)
+
+    asyncio.ensure_future(_diag_loop(pc, peer))
     return web.json_response(
         {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
