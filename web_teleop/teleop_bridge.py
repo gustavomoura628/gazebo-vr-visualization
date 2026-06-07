@@ -500,6 +500,22 @@ async def time_http(request):
                              headers={"Cache-Control": "no-store"})
 
 
+# Bump on every meaningful bridge change so `curl -k https://<host>:8443/version`
+# tells us EXACTLY which build is running -- no more guessing across machines.
+BRIDGE_VERSION = "2026-06-07.4-mtu+stun"
+
+
+async def version_http(request):
+    """Report the running build + the live config that reveals which fixes are in.
+    stun_disabled:true  => has the iceServers=[] fix (offer can't hang on STUN).
+    rtc_mtu:1000        => has the MTU caps (media fits a 1280 tunnel)."""
+    return web.json_response({
+        "version": BRIDGE_VERSION,
+        "rtc_mtu": _RTC_MTU,
+        "stun_disabled": len(_ICE_CONFIG.iceServers or []) == 0,
+    }, headers={"Cache-Control": "no-store"})
+
+
 async def cmd_http(request):
     """Fire-and-forget HTTP control fallback: /cmd?vx=&vy=&vyaw="""
     q = request.rel_url.query
@@ -677,6 +693,7 @@ def make_app():
     app.router.add_get("/cmd", cmd_http)
     app.router.add_get("/stop", stop_http)
     app.router.add_get("/time", time_http)
+    app.router.add_get("/version", version_http)
     app.router.add_get("/{name}", static_file)
     return app
 
